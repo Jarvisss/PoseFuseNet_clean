@@ -1,5 +1,6 @@
 # PoseFuseNet
 This is the official code released for paper: [IJCAI 2021]
+![Pipeline](https://github.com/Jarvisss/PoseFuseNet/blob/master/Pipeline_v2.png)
 
 
 ## Training Procedure
