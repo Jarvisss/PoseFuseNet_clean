@@ -181,7 +181,6 @@ def get_visualize_result(opt, ref_xs, ref_ys, gx, gy, gp, gp_hat, xf_merge, x_ha
 
     g_x = gx[DISPLAY_BATCH].permute(1,2,0) * 255.0
     g_y = gy[DISPLAY_BATCH][17:20,...].permute(1,2,0)* 255.0
-    g_p = gp.to(cpu).numpy()
     out = x_hat[DISPLAY_BATCH].permute(1,2,0) * 255.0 # (256,256,3)
     
     white = torch.ones(out.size()).to(device) * 255.0
@@ -196,8 +195,12 @@ def get_visualize_result(opt, ref_xs, ref_ys, gx, gy, gp, gp_hat, xf_merge, x_ha
 
 
     img_shape = out.shape[0:2]
-    visual_gp = visualize_parsing(g_p, DISPLAY_BATCH)
-    visual_gp = torch.from_numpy(visual_gp).to(device).float()
+    if gp is not None:
+        g_p = gp.to(cpu).numpy()
+        visual_gp = visualize_parsing(g_p, DISPLAY_BATCH)
+        visual_gp = torch.from_numpy(visual_gp).to(device).float()
+    else:
+        visual_gp = white
 
     if gp_hat is not None:
         g_phat = gp_hat.to(cpu).numpy()

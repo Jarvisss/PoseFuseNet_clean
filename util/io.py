@@ -67,13 +67,26 @@ def load_parsing(parsing_path, load_size=(256,256)):
     parsing_img_map = F.to_tensor(parsing_img_map) # [20, H, W]
     return parsing_img_map
 
+def getAffineParam(angle, scale, shift):
+    if not self.angle and not self.scale and not self.shift:
+        affine_param = None
+        return affine_param
+    else:
+        affine_param=dict()
+        affine_param['angle'] = np.random.uniform(low=self.angle[0], high=self.angle[1]) if self.angle is not False else 0
+        affine_param['scale'] = np.random.uniform(low=self.scale[0], high=self.scale[1]) if self.scale is not False else 1
+        shift_x = np.random.uniform(low=-self.shift[0], high=self.shift[0]) if self.shift is not False else 0
+        shift_y = np.random.uniform(low=-self.shift[1], high=self.shift[1]) if self.shift is not False else 0
+        affine_param['shift']=(shift_x, shift_y)
 
-def load_skeleton(B_path, load_size=(256,256), is_clean_pose=False, no_bone_RGB=False, pose_scale=255):
+        return affine_param
+
+def load_skeleton(B_path, load_size=(256,256), is_clean_pose=False, no_bone_RGB=False, pose_scale=255, affine=None):
     from util import openpose_utils
     
     B_coor = json.load(open(B_path))["people"]
     B_coor = B_coor[0]
-    pose_dict = openpose_utils.obtain_2d_cords(B_coor, resize_param=load_size, org_size=load_size)
+    pose_dict = openpose_utils.obtain_2d_cords(B_coor, resize_param=load_size, org_size=load_size, affine=affine)
     pose_body = pose_dict['body']
     if not is_clean_pose:
         pose_body = openpose_utils.openpose18_to_coco17(pose_body)

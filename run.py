@@ -101,10 +101,13 @@ def get_parser():
     parser.add_argument('--test_id', type=str, default='default', help = 'test experiment ID. the experiment dir will be set as "./checkpoint/id/"')
     parser.add_argument('--test_id_parse', type=str, default='default', help = 'test parse experiment ID. the experiment dir will be set as "./checkpoint/id/"')
     parser.add_argument('--ref_ids', type=str, default='0', help='test ref ids')
-    parser.add_argument('--test_dataset', type=str, default='danceFashion', help='"danceFashion" or "iper"')
+    parser.add_argument('--test_source_dataset', type=str, default='danceFashion', help='"danceFashion" or "iper"')
     parser.add_argument('--test_source', type=str, default='A15Ei5ve9BS', help='a test video in dataset as ref images')
-    parser.add_argument('--test_target_motion', type=str, default='A15Ei5ve9BS', help='a test video in dataset as ref motions')
+    parser.add_argument('--test_target_dataset', type=str, default='danceFashion', help='"danceFashion" or "iper"')
+    parser.add_argument('--test_target', type=str, default='A15Ei5ve9BS', help='a test video in dataset as ref motions')
     parser.add_argument('--parse_use_attn', action='store_true', help='use attention for multi-view parsing generation')
+    parser.add_argument('--no_gt_parsing',action='store_false', help='specified to test on no gt parsing dataset')
+    parser.add_argument('--test_freq', type=int, default=5, help='every t images perform one test')
 
     '''Experiment options'''
     parser.add_argument('--no_mask', action='store_true', help='open this if do not use mask')
@@ -374,8 +377,8 @@ def train(opt, exp_name):
             writer.add_scalar('loss/lossG_content', lossG_content.item(), global_step=i_batch_total, walltime=None)
             writer.add_scalar('loss/lossG_style', lossG_style.item(), global_step=i_batch_total, walltime=None)
             writer.add_scalar('loss/lossG_L1', lossG_L1.item(), global_step=i_batch_total, walltime=None)
-            # lossG = lossG_content + lossG_style + lossG_L1
-            lossG = 0
+            lossG = lossG_content + lossG_style + lossG_L1
+            # lossG = 0
             if opt.use_mask_reg:
                 lossAttentionReg = torch.mean(mask[:,0:1,...] * mask[:,1:2,...] * mask[:,2:3,...] * mask[:,3:4,...]) * opt.K**opt.K * lambda_regattn
                 lossG += lossAttentionReg
@@ -433,7 +436,7 @@ def train(opt, exp_name):
                     ''' choice 1. constrain flow at each pixel, (dir*(f-fmax)+fmax) * attn
                     '''
                     # loss_gmm += torch.sum( ( (offset_flows[k]-offset_flows_max)*sims[k]+offset_flows_max ) * attn_k ) / torch.sum(g_c) # F * A / Batchsize / area_of_1
-                    ''' choice 2. constrain flow at a whole region, (dir*(f_avg-fmax)+fmax) * attn
+                    ''' choice 2. constrain flow at a whole region, (dir*(f_avg-f_avgmax)+f_avgmax) * attn
                     '''
                     flow_mean = flow_means[k].view(flow_means[k].shape[0]) #  [B]
                     flow_weight = ((flow_mean - flow_means_max) * sims[k]+ flow_means_max).unsqueeze(1).unsqueeze(1).unsqueeze(1)
@@ -471,8 +474,8 @@ def train(opt, exp_name):
             writer.add_scalar('loss/lossG', lossG.item(), global_step=i_batch_total, walltime=None)
             i_batch_total += 1
                         
-            # post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
-            post_fix_str = 'Epoch_loss=%.3f'%(epoch_loss_G_moving)
+            post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
+            # post_fix_str = 'Epoch_loss=%.3f'%(epoch_loss_G_moving)
             if opt.use_mask_reg:
                 post_fix_str += ',L_reg=%.3f'%lossAttentionReg
             if opt.use_sample_correctness:
@@ -588,28 +591,35 @@ def test(opt):
 
     if opt.use_parsing:
         parse_name = opt.test_id_parse
-    test_dataset = opt.test_dataset
+    test_source_dataset = opt.test_source_dataset
     test_source = opt.test_source
-    test_motion = opt.test_target_motion
+    test_target_dataset = opt.test_target_dataset
+    test_target = opt.test_target
 
     print('Experim: ', experiment_name)
-    print('Dataset: ', test_dataset)
+    print('Source Dataset: ', test_source_dataset)
     print('Source : ', test_source)
-    print('Motion : ', test_motion)
+    print('Motion Dataset : ', test_target_dataset)
+    print('Motion : ', test_target)
 
     """Create dataset and dataloader"""
-    path_to_test_A = '/dataset/ljw/{0}/test_256/train_A/'.format(test_dataset)
-    path_to_test_kps = '/dataset/ljw/{0}/test_256/train_alphapose/'.format(test_dataset)
-    path_to_test_parsing = '/dataset/ljw/{0}/test_256/parsing_A/'.format(test_dataset)
+    path_to_test_A = '/dataset/ljw/{0}/test_256/train_A/'.format(test_source_dataset)
+    path_to_test_kps = '/dataset/ljw/{0}/test_256/train_alphapose/'.format(test_source_dataset)
+    path_to_test_parsing = '/dataset/ljw/{0}/test_256/parsing_A/'.format(test_source_dataset)
     if opt.use_clean_pose:
-        path_to_test_kps = '/dataset/ljw/{0}/test_256/train_video2d/'.format(test_dataset)
+        path_to_test_kps = '/dataset/ljw/{0}/test_256/train_video2d/'.format(test_source_dataset)
     path_to_test_source_imgs = os.path.join(path_to_test_A, test_source)
     path_to_test_source_kps = os.path.join(path_to_test_kps, test_source)
     path_to_test_source_parse = os.path.join(path_to_test_parsing, test_source)
 
-    path_to_test_tgt_motions = os.path.join(path_to_test_A, test_motion)
-    path_to_test_tgt_kps = os.path.join(path_to_test_kps, test_motion)
-    path_to_test_tgt_parse = os.path.join(path_to_test_parsing, test_motion)
+    path_to_test_A = '/dataset/ljw/{0}/test_256/train_A/'.format(test_target_dataset)
+    path_to_test_kps = '/dataset/ljw/{0}/test_256/train_alphapose/'.format(test_target_dataset)
+    path_to_test_parsing = '/dataset/ljw/{0}/test_256/parsing_A/'.format(test_target_dataset)
+    if opt.use_clean_pose:
+        path_to_test_kps = '/dataset/ljw/{0}/test_256/train_video2d/'.format(test_target_dataset)
+    path_to_test_tgt_motions = os.path.join(path_to_test_A, test_target)
+    path_to_test_tgt_kps = os.path.join(path_to_test_kps, test_target)
+    path_to_test_tgt_parse = os.path.join(path_to_test_parsing, test_target)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
     ref_ids = opt.ref_ids
@@ -626,38 +636,33 @@ def test(opt):
     if opt.use_parsing:
         path_to_parse_ckpt_dir = opt.root_dir+ 'checkpoints/{0}/'.format(parse_name)
         path_to_parse_chkpt = path_to_parse_ckpt_dir + 'seg_model_weights.tar' 
-        test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}/'.format(experiment_name+';'+parse_name,test_dataset, test_source)
+        test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}/'.format(experiment_name+';'+parse_name,test_source_dataset, test_source)
     else:
-        test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}/'.format(experiment_name,test_dataset, test_source)
+        test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}/'.format(experiment_name,test_source_dataset, test_source)
 
-    test_result_vid_dir = test_result_dir + test_motion
+    test_result_vid_dir = test_result_dir + test_target
     for ref_name in ref_names:
         test_result_vid_dir += '_{0}'.format(ref_name)
+    print(test_result_vid_dir)
     if not os.path.isdir(test_result_vid_dir):
         os.makedirs(test_result_vid_dir)
 
     '''Create Model'''
     GF_inc = 43 if not opt.use_parsing else 83
+    GP_inc = 20+20+3
     GF = nn.DataParallel(FlowGenerator(inc=GF_inc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral, mask_use_sigmoid=opt.mask_sigmoid).to(device)) # dx + dx + dy = 3 + 20 + 20
     GE = nn.DataParallel(AppearanceEncoder(n_layers=opt.n_enc, inc=3, use_spectral_norm=opt.use_spectral).to(device)) # dx = 3
     GD = nn.DataParallel(AppearanceDecoder(n_bottleneck_layers=opt.n_btn, n_decode_layers=opt.n_enc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral).to(device)) # df = 256
-    GP = nn.DataParallel(ParsingGenerator(inc=43, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral, use_attn=opt.parse_use_attn))
-    # if opt.use_attnflow:
-
-    #     setattr(opt, 'input_nc', 1) 
-    #     setattr(opt, 'grid_size', 5) 
-    #     setattr(opt, 'radius', 5) 
-    #     setattr(opt, 'n_layers', 3) 
-    #     setattr(opt, 'fine_height', 256) 
-    #     setattr(opt, 'fine_width', 256) 
-
-    #     gmm = nn.DataParallel(GMM(opt, rigid=False))
-    #     gmm.eval() # eval mode as we do not train gmm in this network
-
-    #     gmm_ckpt = torch.load('',map_location=cpu)
-    #     gmm.module.load_state_dict(gmm_ckpt['gmm_state_dict'], strict=False)
-    #     gmm_epoch = gmm_ckpt['epoch']
-    #     print('gmm Epoch:', gmm_epoch)
+    GP = nn.DataParallel(ParsingGenerator(inc=GP_inc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral, use_attn=opt.parse_use_attn))
+    '''Load freezed eval model'''
+    if opt.use_attnflow:
+        if opt.use_rigid:
+            tps_gmm, rigid_gmm = load_gmm(opt, True)
+            tps_gmm.eval()
+            rigid_gmm.eval()
+        else:
+            tps_gmm = load_gmm(opt, False)
+            tps_gmm.eval()
 
     GF.eval()
     GE.eval()
@@ -676,37 +681,48 @@ def test(opt):
         parse_ckpt = torch.load(path_to_parse_chkpt, map_location=cpu)
         GP.module.load_state_dict(parse_ckpt['GP_state_dict'], strict=False)
 
+    affine_param = None
+    if opt.test_target_dataset == 'iper':
+        affine_param = {'angle':0,'scale':1.3, 'shift':(0,-15)}
 
-    ref_xs = []
-    ref_ys = []
-    ref_ps = []
+    ori_ref_xs = []
+    ori_ref_ys = []
+    ori_ref_ps = []
     for i, ref_name in enumerate(ref_names):
-        ref_xs += [load_image(os.path.join(path_to_test_source_imgs, ref_name+'.png')).unsqueeze(0).to(device)]
-        ref_ys += [load_skeleton(os.path.join(path_to_test_source_kps, ref_name+'.json'), is_clean_pose=opt.use_clean_pose).unsqueeze(0).to(device)]
-        ref_ps += [load_parsing(os.path.join(path_to_test_source_parse, ref_name+'.png')).unsqueeze(0).to(device)]
+        ori_ref_xs += [load_image(os.path.join(path_to_test_source_imgs, ref_name+'.png')).unsqueeze(0).to(device)]
+        ori_ref_ys += [load_skeleton(os.path.join(path_to_test_source_kps, ref_name+'.json'), is_clean_pose=opt.use_clean_pose).unsqueeze(0).to(device)]
+        ori_ref_ps += [load_parsing(os.path.join(path_to_test_source_parse, ref_name+'.png')).unsqueeze(0).to(device)]
 
-    K = len(ref_xs)
-    assert(len(ref_xs)==len(ref_ys))
-    assert(len(ref_xs)==len(ref_ps))
+    K = len(ori_ref_xs)
+    assert(len(ori_ref_xs)==len(ori_ref_ys))
+    assert(len(ori_ref_xs)==len(ori_ref_ps))
+
+            
+    
 
     avg_l1_loss, gt_sum = 0,0
 
-    for gt_id in tqdm(range(0, total_gts, 5)):
+    for gt_id in tqdm(range(0, total_gts, opt.test_freq)):
         gt_name = '{:05d}'.format(gt_id)
         gt_sum += 1
         g_x = load_image(os.path.join(path_to_test_tgt_motions, gt_name+'.png')).unsqueeze(0).to(device)
-        g_y = load_skeleton(os.path.join(path_to_test_tgt_kps, gt_name+'.json'), is_clean_pose=opt.use_clean_pose).unsqueeze(0).to(device)
-
-        # as we do not have ground truth parsing for testing
-        g_p = load_parsing(os.path.join(path_to_test_tgt_parse, gt_name+'.png')).unsqueeze(0).to(device)
         
+        
+        g_y = load_skeleton(os.path.join(path_to_test_tgt_kps, gt_name+'.json'), is_clean_pose=opt.use_clean_pose, affine=affine_param).unsqueeze(0).to(device)
+        # as we do not have ground truth parsing for testing
+        g_p = None
+        if not opt.no_gt_parsing:
+            g_p = load_parsing(os.path.join(path_to_test_tgt_parse, gt_name+'.png')).unsqueeze(0).to(device)
+        
+
+        g_phat = None
+        '''Use parsing generator to get target p_hat'''
         if opt.use_parsing:
-            '''Use parsing generator to get target p_hat'''
             logits = []
             attns = []
             if opt.parse_use_attn:
                 for k in range(0, K):
-                    logit_k,attn_k = GP(ref_xs[k], ref_ps[k], g_y) # [B, 20, H, W], [B, 1, H, W]
+                    logit_k,attn_k = GP(ori_ref_xs[k], ori_ref_ps[k], g_y) # [B, 20, H, W], [B, 1, H, W]
                     logits += [logit_k]
                     attns += [attn_k]
                 attns = torch.cat(attns, dim=1)
@@ -716,7 +732,7 @@ def test(opt):
                     logit_avg += logits[k] * attn_norm[:,k:k+1,:,:] #  [B, 20, H, W]
             else:
                 for k in range(0, K):
-                    logit_k = GP(ref_xs[k], ref_ps[k], g_y) # [B, 20, H, W], [B, 1, H, W]
+                    logit_k = GP(ori_ref_xs[k], ori_ref_ps[k], g_y) # [B, 20, H, W], [B, 1, H, W]
                     logits += [logit_k]
                 logit_avg = logits[0] / K #  [B, 20, H, W]
                 for k in range(1, K):
@@ -732,11 +748,29 @@ def test(opt):
                     p_hat_bin_map[i, :, :] = (p_hat_indices == i).int()
                 g_phat[batch] = p_hat_bin_map
 
+
         '''Get flows and masks and features'''
         flows, masks, xfs = [], [], []
         flows_down, xfs_warp = [], []
+        ref_xs, ref_ys, ref_ps = ori_ref_xs.copy(), ori_ref_ys.copy(), ori_ref_ps.copy()
         for k in range(0, K):
-            
+            '''Use parsing generator to get target p_hat'''
+            if opt.use_attnflow:
+                if opt.use_rigid and opt.move_rigid:
+                
+                    ref_pk = ori_ref_ps[k] # [B,20, H,W]
+                    ref_ck = ref_pk[:,5:6,...] + ref_pk[:,6:7,...] +ref_pk[:,7:8,...] + ref_pk[:,12:13,...] #[B,1, H,W]
+                    g_c = g_phat[:,5:6,...] + g_phat[:,6:7,...] + g_phat[:,7:8,...] + g_phat[:,12:13,...] #[B,1, H,W]
+                    
+                    rigid_grid, _ = rigid_gmm(ref_ck, g_c) # [B,H,W,2] # this grid is [-1,1]
+                    ref_xs[k] = F.grid_sample(ori_ref_xs[k], rigid_grid, padding_mode='border')
+                    ref_ys[k] = F.grid_sample(ori_ref_ys[k], rigid_grid, padding_mode='border')
+                    ref_ps[k] = F.grid_sample(ori_ref_ps[k], rigid_grid, padding_mode='border')
+            else:
+                ref_xs[k] = ori_ref_xs[k]
+                ref_ys[k] = ori_ref_ys[k]
+                ref_ps[k] = ori_ref_ps[k]
+
             if opt.use_parsing:
                 flow_k, mask_k = GF(ref_xs[k], torch.cat((ref_ys[k], ref_ps[k]), dim=1), torch.cat((g_y, g_phat), dim=1))
             else:
@@ -780,12 +814,9 @@ def test(opt):
         avg_l1_loss += l1loss.item()
 
         '''save image result'''
-        if opt.use_parsing:
-            final_img,simp_img = get_visualize_result(opt, ref_xs, ref_ys, g_x, g_y,g_p,g_phat, xf_merge, x_hat,\
-                    flows, mask_normed, xfs, xfs_warp, xfs_warp_masked)
-        else:
-            final_img,simp_img = get_visualize_result(opt, ref_xs, ref_ys, g_x, g_y,g_p,None, xf_merge, x_hat,\
-                    flows, mask_normed, xfs, xfs_warp, xfs_warp_masked)
+        final_img,simp_img = get_visualize_result(opt, ref_xs, ref_ys, g_x, g_y,g_p,g_phat, xf_merge, x_hat,\
+                flows, mask_normed, xfs, xfs_warp, xfs_warp_masked)
+        
         plt.imsave(os.path.join(test_result_vid_dir,"{0}_result.png".format(gt_name)), final_img)
         plt.imsave(os.path.join(test_result_vid_dir,"{0}_result_simp.png".format(gt_name)), simp_img)
 
@@ -796,7 +827,7 @@ def test(opt):
     
 
     '''save video result'''
-    save_video_name = test_motion
+    save_video_name = test_target
     img_dir = test_result_vid_dir
     save_video_dir = test_result_dir
     for ref_name in ref_names:
@@ -851,7 +882,7 @@ if __name__ == "__main__":
         today = datetime.today().strftime("%Y%m%d")
 
         
-        today = '20201103'
+        today = '20201102'
         experiment_name = 'v{0}_{1}shot_gmm_{2}_rigid_{3}_tv_{4}_lr{5}-{6}'.format(opt.id, opt.K, opt.use_attnflow,opt.use_rigid, opt.use_tv, opt.lr, today)
         # experiment_name = 'v13_2shot_mask_True_soft_True_maskNormtype_softmax_parsing_True_lr0.0001-20201025'
         # experiment_name = 'v13_2shot_mask_True_gmm_False_maskNormtype_softmax_parsing_True_lr0.0001-20201025'

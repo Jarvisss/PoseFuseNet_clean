@@ -360,13 +360,13 @@ class tensor2skeleton():
 
         return colors
 
-    def normalize_pose(pose):
-        normalized_pose = pose
+    # def normalize_pose(pose):
+    #     normalized_pose = pose
         
-        return normalized_pose
-        pass
+    #     return normalized_pose
+    #     pass
     # compare the similarity of two poses with 17 channels, 34 floats each
     def pose_similarity(pose1, pose2):
-        
-    
+        COCO_17
+        LIMB_SEQ_COCO_17
         pass
