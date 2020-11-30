@@ -1,7 +1,58 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.spectral_norm import spectral_norm as SpectralNorm
+import functools
 
+
+def _freeze(*args):
+    """freeze the network for forward process"""
+    for module in args:
+        if module:
+            for p in module.parameters():
+                p.requires_grad = False
+
+
+def _unfreeze(*args):
+    """ unfreeze the network for parameter update"""
+    for module in args:
+        if module:
+            for p in module.parameters():
+                p.requires_grad = True
+
+def get_norm_layer(norm_type='batch'):
+    """Get the normalization layer for the networks"""
+    if norm_type == 'bn':
+        norm_layer = functools.partial(nn.BatchNorm2d, momentum=0.1, affine=True)
+    elif norm_type == 'in':
+        norm_layer = functools.partial(nn.InstanceNorm2d, affine=True)
+    # elif norm_type == 'adain':
+    #     norm_layer = functools.partial(ADAIN)
+    # elif norm_type == 'spade':
+    #     norm_layer = functools.partial(SPADE, config_text='spadeinstance3x3')        
+    elif norm_type == 'none':
+        norm_layer = None
+    else:
+        raise NotImplementedError('normalization layer [%s] is not found' % norm_type)
+
+    if norm_type != 'none':
+        norm_layer.__name__ = norm_type
+
+    return norm_layer
+
+def get_nonlinearity_layer(activation_type='PReLU'):
+    """Get the activation layer for the networks"""
+    if activation_type == 'ReLU':
+        nonlinearity_layer = nn.ReLU()
+    elif activation_type == 'SELU':
+        nonlinearity_layer = nn.SELU()
+    elif activation_type == 'LeakyReLU':
+        nonlinearity_layer = nn.LeakyReLU(0.1)
+    elif activation_type == 'PReLU':
+        nonlinearity_layer = nn.PReLU()
+    else:
+        raise NotImplementedError('activation layer [%s] is not found' % activation_type)
+    return nonlinearity_layer
 
 def make_norm_layer(norm, channels):
     if norm=='bn':
@@ -12,6 +63,13 @@ def make_norm_layer(norm, channels):
         return None
 
 
+def spectral_norm(module, use_spect=True):
+    """use spectral normal layer to stable the training process"""
+    if use_spect:
+        return SpectralNorm(module)
+    else:
+        return module
+
 # grid:(b, 2, H, W) [-1,1]
 def gen_uniform_grid(x):
     [b, c, h, w] = x.shape
@@ -21,39 +79,37 @@ def gen_uniform_grid(x):
     xx = xx.view(1,1,h,w).repeat(b,1,1,1)
     yy = yy.view(1,1,h,w).repeat(b,1,1,1)
     grid = torch.cat((xx,yy), dim=1).float()
-
     grid[:,0,:,:] = 2.0*grid[:,0,:,:]/max(w-1,1) - 1.0
     grid[:,1,:,:] = 2.0*grid[:,1,:,:]/max(h-1,1) - 1.0
     return grid
 
-def warp_flow(x, flow, mode='bilinear', mask=None, mask_value=-1):
+def warp_flow(source, flow, align_corners=True, mode='bilinear', mask=None, mask_value=-1):
     '''
     Warp a image x according to the given flow
     Input:
         x: (b, c, H, W)
-        flow: (b, 2, H, W)
+        flow: (b, 2, H, W) # range [w-1, h-1]
         mask: (b, 1, H, W)
     Ouput:
         y: (b, c, H, W)
     '''
-    [b, c, h, w] = x.shape
+    [b, c, h, w] = source.shape
     # mesh grid
-    xx = x.new_tensor(range(w)).view(1,-1).repeat(h,1)
-    yy = x.new_tensor(range(h)).view(-1,1).repeat(1,w)
-    xx = xx.view(1,1,h,w).repeat(b,1,1,1)
-    yy = yy.view(1,1,h,w).repeat(b,1,1,1)
-    grid = torch.cat((xx,yy), dim=1).float()
-     
-    grid = grid + flow
+    x = torch.arange(w).view(1, -1).expand(h, -1).type_as(source).float() / (w-1)
+    y = torch.arange(h).view(-1, 1).expand(-1, w).type_as(source).float() / (h-1)
+    grid = torch.stack([x,y], dim=0)
+    grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
 
-    # scale to [-1, 1]
-    grid[:,0,:,:] = 2.0*grid[:,0,:,:]/max(w-1,1) - 1.0
-    grid[:,1,:,:] = 2.0*grid[:,1,:,:]/max(h-1,1) - 1.0
+    grid = 2*grid - 1
 
-
+    flow = 2* flow/torch.tensor([w, h]).view(1, 2, 1, 1).expand(b, -1, h, w).type_as(flow)
+    
+    grid = (grid+flow).permute(0, 2, 3, 1)
+    
+    '''grid = grid + flow # in this way flow is -1 to 1
+    '''
     # to (b, h, w, c) for F.grid_sample
-    grid = grid.permute(0,2,3,1)
-    output = F.grid_sample(x, grid, mode=mode, padding_mode='zeros')
+    output = F.grid_sample(source, grid, mode=mode, padding_mode='zeros', align_corners=align_corners)
 
     if mask is not None:
         output = torch.where(mask>0.5, output, output.new_ones(1).mul_(mask_value))
@@ -72,12 +128,90 @@ def warp_flow(x, flow, mode='bilinear', mask=None, mask_value=-1):
 #     input_sample = F.grid_sample(source, grid)
 #     return input_sample
 
+class ADAIN(nn.Module):
+    def __init__(self, norm_nc, feature_nc):
+        super().__init__()
+
+        self.param_free_norm = nn.InstanceNorm2d(norm_nc, affine=False)
+
+        # The dimension of the intermediate embedding space. Yes, hardcoded.
+        nhidden = 128
+        use_bias=True
+
+        self.mlp_shared = nn.Sequential(
+            nn.Linear(feature_nc, nhidden, bias=use_bias),            
+            nn.ReLU()
+        )
+        self.mlp_gamma = nn.Linear(nhidden, norm_nc, bias=use_bias)    
+        self.mlp_beta = nn.Linear(nhidden, norm_nc, bias=use_bias)    
+
+    def forward(self, x, feature):
+
+        # Part 1. generate parameter-free normalized activations
+        normalized = self.param_free_norm(x)
+
+        # Part 2. produce scaling and bias conditioned on feature
+        feature = feature.view(feature.size(0), -1)
+        actv = self.mlp_shared(feature)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+
+        # apply scale and bias
+        gamma = gamma.view(*gamma.size()[:2], 1,1)
+        beta = beta.view(*beta.size()[:2], 1,1)
+        out = normalized * (1 + gamma) + beta
+
+        return out
+
+class Output(nn.Module):
+    """
+    Define the output layer
+    """
+    def __init__(self, input_nc, output_nc, kernel_size = 3, norm_layer=nn.BatchNorm2d, nonlinearity= nn.LeakyReLU(),
+                 use_spect=False, use_coord=False):
+        super(Output, self).__init__()
+
+        kwargs = {'kernel_size': kernel_size, 'padding':0, 'bias': True}
+
+        self.conv1 = spectral_norm(nn.Conv2d(input_nc, output_nc, **kwargs), use_spect)
+
+        if type(norm_layer) == type(None):
+            self.model = nn.Sequential(nonlinearity, nn.ReflectionPad2d(int(kernel_size/2)), self.conv1, nn.Tanh())
+        else:
+            self.model = nn.Sequential(norm_layer(input_nc), nonlinearity, nn.ReflectionPad2d(int(kernel_size / 2)), self.conv1, nn.Tanh())
+
+    def forward(self, x):
+        out = self.model(x)
+
+        return out
+
+class Jump(nn.Module):
+    """
+    Define the output layer
+    """
+    def __init__(self, input_nc, output_nc, kernel_size = 3, norm_layer=nn.BatchNorm2d, nonlinearity= nn.LeakyReLU(),
+                 use_spect=False, use_coord=False):
+        super(Jump, self).__init__()
+
+        kwargs = {'kernel_size': kernel_size, 'padding':0, 'bias': True}
+
+        self.conv1 = spectral_norm(nn.Conv2d(input_nc, output_nc, **kwargs), use_spect)
+
+        if type(norm_layer) == type(None):
+            self.model = nn.Sequential(nonlinearity, nn.ReflectionPad2d(int(kernel_size/2)), self.conv1)
+        else:
+            self.model = nn.Sequential(norm_layer(input_nc), nonlinearity, nn.ReflectionPad2d(int(kernel_size / 2)), self.conv1)
+
+    def forward(self, x):
+        out = self.model(x)
+        return out
+
 class ResBlock2d(nn.Module):
     """
     Res block, preserve spatial resolution.
     """
 
-    def __init__(self, in_features, kernel_size, padding, norm_type='bn', use_spectral_norm=False):
+    def __init__(self, in_features, kernel_size=3, padding=1, norm_type='bn', use_spectral_norm=False):
         super(ResBlock2d, self).__init__()
 
         if use_spectral_norm:
@@ -103,19 +237,21 @@ class ResBlock2d(nn.Module):
         out += x
         return out
 
+
 class ResBlockUpNorm(nn.Module):
-    
-    def __init__(self, in_channel, out_channel, out_size=None, scale = 2, \
-        conv_size=3, padding_size = 1, is_bilinear = True, norm_type='bn', use_spectral_norm=False):
+    """
+    Define a decoder block
+    """
+    def __init__(self, in_channel, out_channel, out_size=None, scale = 2, conv_size=3, padding_size = 1, is_bilinear = True, norm_type='bn', use_spectral_norm=False):
         super(ResBlockUpNorm, self).__init__()
         
         self.in_channel = in_channel
         self.out_channel = out_channel
         
         if is_bilinear:
-            self.upsample = nn.Upsample(size = out_size, scale_factor=scale, mode='bilinear',align_corners=False)
+            self.upsample = nn.Upsample(size = out_size, scale_factor=scale, mode='bilinear',align_corners=True)
         else:
-            self.upsample = nn.Upsample(size = out_size, scale_factor=scale,align_corners=False)
+            self.upsample = nn.Upsample(size = out_size, scale_factor=scale,align_corners=True)
         self.relu = nn.LeakyReLU(inplace = False)
         
         self.norml1 = make_norm_layer(norm_type, in_channel)
@@ -176,6 +312,34 @@ class ConvUp(nn.Module):
         out = self.norm(out)
         out = self.relu(out)
         
+        return out
+
+ 
+
+class ResBlockEncoder(nn.Module):
+    """
+    Define a encoder block
+    """
+    def __init__(self, input_nc, output_nc, hidden_nc=None, norm_layer=nn.BatchNorm2d, nonlinearity= nn.LeakyReLU(),
+                 use_spect=False, use_coord=False):
+        super(ResBlockEncoder, self).__init__()
+
+        hidden_nc = input_nc if hidden_nc is None else hidden_nc
+
+        conv1 = spectral_norm(nn.Conv2d(input_nc, hidden_nc, kernel_size=3, stride=1, padding=1), use_spect)
+        conv2 = spectral_norm(nn.Conv2d(hidden_nc, output_nc, kernel_size=4, stride=2, padding=1), use_spect)
+        bypass = spectral_norm(nn.Conv2d(input_nc, output_nc, kernel_size=1, stride=1, padding=0), use_spect)
+
+        if type(norm_layer) == type(None):
+            self.model = nn.Sequential(nonlinearity, conv1, nonlinearity, conv2,)
+        else:
+            self.model = nn.Sequential(norm_layer(input_nc), nonlinearity, conv1, 
+                                       norm_layer(hidden_nc), nonlinearity, conv2,)
+        
+        self.shortcut = nn.Sequential(nn.AvgPool2d(kernel_size=2, stride=2),bypass)
+
+    def forward(self, x):
+        out = self.model(x) + self.shortcut(x)
         return out
 
 

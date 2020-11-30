@@ -3,7 +3,10 @@ from model.blocks import warp_flow
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from model.resample2d_package.resample2d import Resample2d
+from model.block_extractor.block_extractor   import BlockExtractor
+from model.local_attn_reshape.local_attn_reshape   import LocalAttnReshape
+import numpy as np
 class LossG(nn.Module):
     """
     Loss for generator meta training
@@ -35,16 +38,83 @@ class ParsingLoss(nn.Module):
         loss_ce = self.ceLoss(logits, target)
         return loss_ce
 
+
+class MultiAffineRegularizationLoss(nn.Module):
+    def __init__(self, kz_dic):
+        super(MultiAffineRegularizationLoss, self).__init__()
+        self.kz_dic=kz_dic
+        self.method_dic={}
+        for key in kz_dic:
+            instance = AffineRegularizationLoss(kz_dic[key])
+            self.method_dic[key] = instance
+        self.layers = sorted(kz_dic, reverse=True) 
+ 
+    def __call__(self, flow_fields):
+        loss=0
+        for i in range(len(flow_fields)):
+            method = self.method_dic[self.layers[i]]
+            loss += method(flow_fields[i])
+        return loss
+
+
+
+class AffineRegularizationLoss(nn.Module):
+    """docstring for AffineRegularizationLoss"""
+    # kernel_size: kz
+    def __init__(self, kz):
+        super(AffineRegularizationLoss, self).__init__()
+        self.kz = kz
+        self.criterion = torch.nn.L1Loss()
+        self.extractor = BlockExtractor(kernel_size=kz)
+        self.reshape = LocalAttnReshape()
+
+        temp = np.arange(kz)
+        A = np.ones([kz*kz, 3])
+        A[:, 0] = temp.repeat(kz)
+        A[:, 1] = temp.repeat(kz).reshape((kz,kz)).transpose().reshape(kz**2)
+        AH = A.transpose()
+        k = np.dot(A, np.dot(np.linalg.inv(np.dot(AH, A)), AH)) - np.identity(kz**2) #K = (A((AH A)^-1)AH - I)
+        self.kernel = np.dot(k.transpose(), k)
+        self.kernel = torch.from_numpy(self.kernel).unsqueeze(1).view(kz**2, kz, kz).unsqueeze(1)
+
+    def __call__(self, flow_field):
+        grid = self.flow2grid(flow_field)
+
+        grid_x = grid[:,0,:,:].unsqueeze(1)
+        grid_y = grid[:,1,:,:].unsqueeze(1)
+        weights = self.kernel.type_as(flow_field)
+        loss_x = self.calculate_loss(grid_x, weights)
+        loss_y = self.calculate_loss(grid_y, weights)
+        return loss_x+loss_y
+    
+    def calculate_loss(self, grid, weights):
+        results = nn.functional.conv2d(grid, weights)   # KH K B [b, kz*kz, w, h]
+        b, c, h, w = results.size()
+        kernels_new = self.reshape(results, self.kz)
+        f = torch.zeros(b, 2, h, w).type_as(kernels_new) + float(int(self.kz/2))
+        grid_H = self.extractor(grid, f)
+        result = torch.nn.functional.avg_pool2d(grid_H*kernels_new, self.kz, self.kz)
+        loss = torch.mean(result)*self.kz**2
+        return loss
+
+    def flow2grid(self, flow_field):
+        b,c,h,w = flow_field.size()
+        x = torch.arange(w).view(1, -1).expand(h, -1).type_as(flow_field).float() 
+        y = torch.arange(h).view(-1, 1).expand(-1, w).type_as(flow_field).float()
+        grid = torch.stack([x,y], dim=0)
+        grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
+        return flow_field+grid
+
 class PerceptualCorrectness(nn.Module):
     r"""
     """
 
-    def __init__(self, layer=['rel1_1','relu2_1','relu3_1','relu4_1']):
+    def __init__(self, layer=['relu1_1','relu2_1','relu3_1','relu4_1']):
         super(PerceptualCorrectness, self).__init__()
         self.add_module('vgg', VGG19())
         self.layer = layer  
         self.eps=1e-8 
-        # self.resample = Resample2d(4, 1, sigma=2)
+        self.resample = Resample2d(4, 1, sigma=2)
 
     def __call__(self, target, source, flow_list, used_layers, mask=None, use_bilinear_sampling=True):
         used_layers=sorted(used_layers, reverse=True)
@@ -61,9 +131,12 @@ class PerceptualCorrectness(nn.Module):
         target_vgg = self.target_vgg[layer]
         source_vgg = self.source_vgg[layer]
         [b, c, h, w] = target_vgg.shape
-
+        [bf,cf,hf,wf] = flow.shape
         # maps = F.interpolate(maps, [h,w]).view(b,-1)
         flow = F.interpolate(flow, [h,w])
+
+        # flow[:,0,:,:] = flow[:,0,:,:]  / wf * w
+        # flow[:,1,:,:] = flow[:,1,:,:]  / hf * h
 
         target_all = target_vgg.view(b, c, -1)                      #[b C N2]
         source_all = source_vgg.view(b, c, -1).transpose(1,2)       #[b N2 C]
@@ -80,11 +153,10 @@ class PerceptualCorrectness(nn.Module):
         (correction_max,max_indices) = torch.max(correction, dim=1)
 
         # interple with bilinear sampling
-        # if use_bilinear_sampling:
-        # input_sample = self.bilinear_warp(source_vgg, flow).view(b, c, -1)
-        input_sample = self.warp_flow(source_vgg, flow).view(b, c, -1)
-        # else:
-        #     input_sample = self.resample(source_vgg, flow).view(b, c, -1)
+        if use_bilinear_sampling:
+            input_sample = self.bilinear_warp(source_vgg, flow).view(b, c, -1)
+        else:
+            input_sample = self.resample(source_vgg, flow).view(b, c, -1)
 
         correction_sample = F.cosine_similarity(input_sample, target_all)    #[b 1 N2]
         loss_map = torch.exp(-correction_sample/(correction_max+self.eps))
@@ -105,9 +177,9 @@ class PerceptualCorrectness(nn.Module):
         grid = torch.stack([x,y], dim=0)
         grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
         grid = 2*grid - 1
-        flow = 2*flow/torch.tensor([w-1, h-1]).view(1, 2, 1, 1).expand(b, -1, h, w).type_as(flow)
+        flow = 2*flow/torch.tensor([w, h]).view(1, 2, 1, 1).expand(b, -1, h, w).type_as(flow)
         grid = (grid+flow).permute(0, 2, 3, 1)
-        input_sample = F.grid_sample(source, grid).view(b, c, -1)
+        input_sample = F.grid_sample(source, grid, align_corners=True).view(b, c, -1)
         return input_sample
 
     def warp_flow(self,x,flow):
@@ -156,6 +228,7 @@ class GicLoss(nn.Module):
         super(GicLoss, self).__init__()
         self.dT = DT()
 
+    # expect input to be BHWC
     def forward(self, grid):
         B,H,W,_ = grid.size()
         Gx = grid[:, :, :, 0]

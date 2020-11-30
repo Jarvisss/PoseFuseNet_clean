@@ -2,11 +2,13 @@
 import numpy as np
 from skimage.draw import disk, line_aa, polygon, circle_perimeter_aa
 from skimage import morphology
+from PIL import Image, ImageDraw
 import math
 import numbers
 import torch
+import json
 
-MISSING_VALUE = 0
+MISSING_VALUE = -1
 
 LIMB_SEQ_25 = [[1,2], [1,5], [2,3], [3,4], [5,6], [6,7], [1,8], 
             [8,9], [9,10], [10,11], [11,24], [11,22], [22,23], 
@@ -53,6 +55,13 @@ def uint82bin(n, count=8):
     """returns the binary of integer n, count refers to amount of bits"""
     return ''.join([str((n >> y) & 1) for y in range(count-1, -1, -1)])
 
+
+def load_pose_cords_from_strings(y_str, x_str):
+    """returns [2, 18] np array"""
+    y_cords = np.array(json.loads(y_str))
+    x_cords = np.array(json.loads(x_str))
+    return np.concatenate([np.expand_dims(y_cords, 0), np.expand_dims(x_cords, 0)], axis=0)
+
 def labelcolormap(N):
     if N == 18: # CelebAMask-HQ
         cmap = np.array([[255, 0, 0],   [255, 85, 0], [255, 170, 0], [255, 255, 0], 
@@ -97,7 +106,65 @@ class Colorize(object):
         color_image = color_image.float()/255.0 * 2 - 1
         return color_image    
 
+'''
+    Input: @ref [2, 18] coords y,x order, @length [13] scale value,
+    Output: [13,256,256] tensor , each channel is one bone
+'''
+def to_map(ref, length, length_max, line_width=5):
+    LIMB_SEQ = [[1,2], [1,5], [2,3], [3,4], [5,6], [6,7], [1,8], 
+        [8,9], [9,10], [1,11], [11,12], [12,13], [1,0]]
+    OPENPOSE_18 = { "Nose":0,"Neck":1,"RShoulder":2,"RElbow":3,"RWrist":4,"LShoulder":5,"LElbow":6,
+            "LWrist":7,"RHip":8,"RKnee":9,"RAnkle":10,"LHip":11,"LKnee":12,"LAnkle":13,
+            "REye":14,"LEye":15,"REar":16,"LEar":17 }  
+    
+    images = []
+    for i, limb in enumerate(LIMB_SEQ):
+        intensity =(255 * length[i]/ length_max).int().item()
+        image = Image.new('RGB', (2**8, 2**8), 'black')
+        draw = ImageDraw.Draw(image, 'RGB')
+        draw.line([tuple(ref[:,limb[1]].numpy()[::-1].tolist()), tuple(ref[:,limb[0]].numpy()[::-1].tolist())], fill=(intensity,intensity,intensity), width=line_width)
+        image_np = np.array(image)[:,:,0:1] # 256,256,1
+        images += [image_np]
+    
+    full_image = np.concatenate(images, axis=2) # 256,256,13
+    import torchvision.transforms.functional as F
+    full_image = F.to_tensor(full_image) # 13,256,256
+    # print(full_image[0][0][0].item())
+    # image_np = np.array(image)
+    return full_image
 
+'''
+    get pose similarity map by calculate [dx, dy] for each bone segment, except head's
+        @ g_j:      [2, 18] tensor,  y,x order
+        @ ref_js:   K * [2, 18] tensor, y,x order
+    return:
+        @  K * [13,256,256] tensor
+'''
+def get_pose_similarity_maps(gt, refs):
+    LIMB_SEQ = [[1,2], [1,5], [2,3], [3,4], [5,6], [6,7], [1,8], 
+    [8,9], [9,10], [1,11], [11,12], [12,13], [1,0]]  # 13 limbs , 计算向量，平移不变
+    
+    g_dirs = []
+    for limb in LIMB_SEQ:
+        g_dir = gt[:,limb[1]] - gt[:, limb[0]]
+        g_dirs += [g_dir]
+    
+    similarity_maps = [] # K * [256,256,3]
+    k_lengths = [] # K * [13]
+    length_max = 0 # max length in K samples
+    for ref in refs:
+        lengths = torch.zeros(len(LIMB_SEQ))
+        for i,limb in enumerate(LIMB_SEQ):
+            j_dir = ref[:,limb[1]] - ref[:, limb[0]]
+            lengths[i] = torch.sqrt(torch.sum((g_dirs[i] - j_dir)**2))
+            if length_max < lengths[i]:
+                length_max = lengths[i]
+        k_lengths += [lengths]
+    
+    for i,ref in enumerate(refs):
+        similarity_maps += [to_map(refs[i], k_lengths[i], length_max)]
+    
+    return similarity_maps
 
 def openpose_to_map(B_coor, resize_param=None, org_size=None, sigma=6, affine=None):
     pose_joints = obtain_2d_cords(B_coor, resize_param, org_size, affine)
@@ -164,7 +231,6 @@ def draw_joint(colors, pose_joints, joint_line_list, radius=2):
     return colors
 
 
-
 def obtain_2d_cords(B_coor, resize_param=None, org_size=None, affine=None):
     pose_joints=dict()
     pose = B_coor["pose_keypoints_2d"]
@@ -175,6 +241,18 @@ def obtain_2d_cords(B_coor, resize_param=None, org_size=None, affine=None):
     pose_joints['body'] = coor_body
 
     return pose_joints
+
+'''Get the dx,dy from source pose to target pose
+    input: [2,18] numpy array or tensor
+'''
+def get_distance(source_pose, target_pose):
+    LHip_idx = OPENPOSE_18['LHip']
+    RHip_idx = OPENPOSE_18['RHip']
+    source_root = (source_pose[:,LHip_idx] + source_pose[:, RHip_idx])/2
+    target_root = (target_pose[:,LHip_idx] + target_pose[:, RHip_idx])/2
+
+    dy, dx = target_root - source_root
+    return dx, dy
 
 def modify_coor(coor_x, coor_y, resize_param=None, org_size=None, affine=None):
     out_img_size = org_size

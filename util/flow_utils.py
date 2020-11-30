@@ -1,5 +1,8 @@
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('agg')
+from matplotlib import pyplot as plt
+import cv2
 
 def flow2img(flow_data):
     """
@@ -39,6 +42,24 @@ def flow2img(flow_data):
     img[idx] = 0
 
     return np.uint8(img)
+
+def flow2arrow(flow_data, arrow_step=(2,2)): 
+    """
+    convert optical flow into arrow image, flow is sample on [0,W-1] grid
+    :param flow_data, sample_step
+    :return: flow arrow image
+    """
+    h, w = flow_data.shape[0],flow_data.shape[1]
+    u = flow_data[:, :, 0]
+    v = flow_data[:, :, 1]
+    arrow_img = np.ones((h,w,3)) * 255
+
+    print(np.max(u), np.max(v))    
+    for i in range(arrow_step[0]//2, h-arrow_step[0]//2, arrow_step[0]):
+        for j in range(arrow_step[1]//2, w-arrow_step[1]//2, arrow_step[1]):
+            arrow_img  = cv2.arrowedLine(arrow_img, (j, i), (j+int(u[i,j]), i+int(v[i,j])),line_type=cv2.LINE_AA, color=(0,0,0))
+
+    return np.uint8(arrow_img)
 
 def compute_color(u, v):
     """

@@ -74,7 +74,7 @@ class FeatureRegression(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        x = x.view(x.size(0), -1)
+        x = x.contiguous().view(x.size(0), -1)
         x = self.linear(x)
         x = self.tanh(x)
         return x
@@ -111,7 +111,7 @@ class RigidGridGen(nn.Module):
         affine_theta_row2 = torch.cat((torch.sin(angle),torch.cos(angle), dy), dim=1).unsqueeze(1)
         affine_theta = torch.cat((affine_theta_row1, affine_theta_row2), dim=1)
         out_size = torch.Size((B,self.out_ch,self.out_h,self.out_w))
-        return F.affine_grid(affine_theta, out_size)
+        return F.affine_grid(affine_theta, out_size, align_corners=True)
         
 class TpsGridGen(nn.Module):
     def __init__(self, out_h=256, out_w=192, use_regular_grid=True, grid_size=3, reg_factor=0, use_cuda=True):

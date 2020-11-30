@@ -5,6 +5,7 @@ from PIL import Image
 import torch
 import numpy as np
 import torchvision.transforms.functional as F
+from time import time
 #io functions of SCRC
 def load_str_list(filename, end = '\n'):
     with open(filename, 'r') as f:
@@ -55,6 +56,8 @@ def load_image(A_path, name='fashion', load_size=(256,256)):
     # padding white color after affine transformation  
     fillWhiteColor = True if name =='fashion' else False
     Ai = transform_image(A_img, load_size, fillWhiteColor=fillWhiteColor)
+    if Ai.shape[0]>3:
+        Ai = Ai[:3,...]
     return Ai
 
 def load_parsing(parsing_path, load_size=(256,256)):
@@ -82,14 +85,15 @@ def getAffineParam(angle, scale, shift):
         return affine_param
 
 def load_skeleton(B_path, load_size=(256,256), is_clean_pose=False, no_bone_RGB=False, pose_scale=255, affine=None):
+    
     from util import openpose_utils
     
     B_coor = json.load(open(B_path))["people"]
     B_coor = B_coor[0]
     pose_dict = openpose_utils.obtain_2d_cords(B_coor, resize_param=load_size, org_size=load_size, affine=affine)
-    pose_body = pose_dict['body']
+    alpha_pose_body = pose_dict['body']
     if not is_clean_pose:
-        pose_body = openpose_utils.openpose18_to_coco17(pose_body)
+        pose_body = openpose_utils.openpose18_to_coco17(alpha_pose_body)
 
     pose_numpy = openpose_utils.obtain_map(pose_body, load_size) 
     pose = np.transpose(pose_numpy,(2, 0, 1))
@@ -103,8 +107,7 @@ def load_skeleton(B_path, load_size=(256,256), is_clean_pose=False, no_bone_RGB=
         color = color / pose_scale # normalize to 0-1
         color = torch.Tensor(color)
         Bi = torch.cat((Bi, color), dim=0)
-
-    return Bi
+    return Bi, torch.Tensor(alpha_pose_body)
 
 
 
