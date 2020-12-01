@@ -310,7 +310,7 @@ def tensor2im(x, display_batch=0, is_parsing=False,is_mask=False, out_size=(256,
     return img
 
 
-def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp, gp_hat, flows, masks_normed, ref_features, g_features):
+def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp, gp_hat, flows, masks_normed,occlusions, ref_features, g_features):
     '''
     ref_xs: K[HW]
     ref_ys: K[HW]
@@ -369,12 +369,13 @@ def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp
     
     visual_ref_xs_tensor = torch.cat(visual_ref_xs, dim=1)
     simp_img = torch.cat((visual_ref_xs_tensor,visual_out,visual_g_x),dim=1).type(torch.uint8).to(cpu).numpy()
-    if not opt.output_all:
+    if not opt.output_all and not opt.phase=='train':
         return None, simp_img, None
 
     visual_feats = [0] * K * layers
     visual_warp_feats = [0] * K * layers
     visual_masks = [0] * K * layers
+    visual_occlusions = [0] * K * layers
     visual_masked_feats = [0] * K * layers
     visual_warp_imgs = [0] * K * layers
     
@@ -383,6 +384,10 @@ def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp
         for k in range(K):
             visual_feats[i*K + k] = tensor2im(ref_features[k][i], out_size=out_size)
             visual_masks[i*K + k] = tensor2im(masks_normed[k][i], is_mask=True, out_size=out_size)
+            if occlusions is None:
+                visual_occlusions[i*K+k] = tensor2im(None, is_mask=True, out_size=out_size)
+            else:
+                visual_occlusions[i*K+k] = tensor2im(occlusions[k][i], is_mask=True, out_size=out_size)
 
             warp_feature = warp_flow(ref_features[k][i], flows[k][i])
             ref_img_down = F.interpolate(ref_xs[k], flows[k][i].shape[2:],mode='bilinear',align_corners=True)
@@ -420,22 +425,28 @@ def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp
         visual_warp_images = [0]*layers
         visual_masked_features = [0]*layers
         visual_maskss = [0]*layers
+        visual_occlusionss = [0] * layers
         for l in range(layers):
             visual_features[l] = visual_feats[l*K+k]
             visual_warp_features[l] = visual_warp_feats[l*K+k]
             visual_warp_images[l] = visual_warp_imgs[l*K+k]
             visual_masked_features[l] = visual_masked_feats[l*K+k]
             visual_maskss[l] = visual_masks[l*K+k]
+            visual_occlusionss[l] = visual_occlusions[l*K+k]
         
         visual_features  = torch.cat(visual_features, dim=0)
         visual_warp_features  = torch.cat(visual_warp_features, dim=0)
         visual_warp_images  = torch.cat(visual_warp_images, dim=0)
         visual_masked_features  = torch.cat(visual_masked_features, dim=0)
         visual_maskss  = torch.cat(visual_maskss, dim=0)
+        visual_occlusionss = torch.cat(visual_occlusionss, dim=0)
+        # print(visual_occlusionss.shape)
 
         ref[k] = torch.cat((visual_ref_xs[k], visual_ref_ys[k], visual_features,visual_warp_features, white), dim=0)
-        feat[k] = torch.cat((white,white,visual_maskss, visual_masked_features, white ),dim=0)
- 
+        if occlusions is None:
+            feat[k] = torch.cat((white,white,visual_maskss, visual_masked_features, white ),dim=0)
+        else:
+            feat[k] = torch.cat((visual_occlusionss, visual_maskss, visual_masked_features, white), dim=0)
 
     refs = torch.cat(ref, dim=1)
     # ps = torch.cat(visual_ref_ps, dim=1)

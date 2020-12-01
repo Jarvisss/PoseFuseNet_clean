@@ -82,6 +82,8 @@ def get_parser():
     parser.add_argument('--epochs', type=int, default=500, help='num epochs')
     parser.add_argument('--use_scheduler', action='store_true', help='open this to use learning rate scheduler')
     parser.add_argument('--anno_size', type=int, nargs=2, help='input annotation size')
+    parser.add_argument('--model_save_freq', type=int, default=2000, help='save model every N iters')
+    parser.add_argument('--img_save_freq', type=int, default=200, help='save image every N iters')
 
     '''Dataset options'''
     parser.add_argument('--use_clean_pose', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
@@ -94,7 +96,8 @@ def get_parser():
     parser.add_argument('--norm_type', type=str, default='in', help='normalization type in network, "in" or "bn"')
     parser.add_argument('--use_spectral_G', action='store_true', help='open this if use spectral normalization in generator')
     parser.add_argument('--use_spectral_D', action='store_true', help='open this if use spectral normalization in discriminator')
-    
+    parser.add_argument('--activation', type=str, default='LeakyReLU', help='"ReLU" or "LeakyReLU"')
+    parser.add_argument('--use_pose_decoder', action='store_true', help='use pose in the target decoder')
 
     '''Test options'''
     # if --test is open
@@ -220,29 +223,51 @@ def init_discriminator(opt, path_to_chkpt):
         print('...Done')
     return D, optimizerD
 
+def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,path_to_chkpt_G):
+    GE_state_dict = GE.state_dict() if not parallel else GE.module.state_dict()
+    GF_state_dict = GF.state_dict() if not parallel else GF.module.state_dict()
+    GD_state_dict = GD.state_dict() if not parallel else GD.module.state_dict()
+    torch.save({
+        'epoch': epoch,
+        'lossesG': lossesG,
+        'GE_state_dict': GE_state_dict,
+        'GF_state_dict': GF_state_dict,
+        'GD_state_dict': GD_state_dict,
+        'i_batch': i_batch,
+        'optimizerG': optimizerG.state_dict(),
+    }, path_to_chkpt_G)
+
 def init_generator(opt, path_to_chkpt):
-    GF_inc = 45
+    image_nc = 3
+    structure_nc = 21
+    flow_layers = [2,3]
     if opt.use_parsing:
-        GF_inc+= 40 
+        structure_nc += 20
     if opt.use_simmap:
-        GF_inc += 13
+        image_nc += 13
+
+    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    
+    if not opt.use_pose_decoder:
+        GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+            activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+    else:
+        GD = PoseAwareAppearanceDecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+            activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
 
     if opt.parallel:
-        GF = nn.DataParallel(FlowGenerator(inc=GF_inc,n_layers=opt.n_enc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral_G, mask_use_sigmoid=opt.mask_sigmoid).to(device)) # dx + dx + dy = 3 + 20 + 20
-        GE = nn.DataParallel(AppearanceEncoder(n_layers=opt.n_enc, inc=3, use_spectral_norm=opt.use_spectral_G).to(device)) # dx = 3
-        GD = nn.DataParallel(AppearanceDecoder(n_bottleneck_layers=opt.n_btn, n_decode_layers=opt.n_enc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral_G).to(device)) # df = 256
-    else:
-        GF = FlowGenerator(image_nc=3, structure_nc=21, n_layers=5, flow_layers=[2,3], ngf=32, max_nc=256, norm_type=opt.norm_type,use_spectral_norm=opt.use_spectral_G).to(device)
+        GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
+        GE = nn.DataParallel(GE)
+        GD = nn.DataParallel(GD)
 
-        # GF = FlowGenerator(inc=GF_inc,n_layers=opt.n_enc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral_G, mask_use_sigmoid=opt.mask_sigmoid).to(device) # dx + dx + dy = 3 + 20 + 20
-        GE = AppearanceEncoder(n_layers=opt.n_enc, inc=3, use_spectral_norm=opt.use_spectral_G).to(device) # dx = 3
-        GD = AppearanceDecoder(n_bottleneck_layers=opt.n_btn, n_decode_layers=opt.n_enc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral_G).to(device) # df = 256
-
+    GF = GF.to(device)
+    GE = GE.to(device)
+    GD = GD.to(device)
 
     optimizerG = optim.Adam(params = list(GF.parameters()) + list(GE.parameters()) + list(GD.parameters()) ,
                             lr=opt.lr,
-                            amsgrad=False,
-                            betas=(0.9,0.999))
+                            amsgrad=False)
     if opt.use_scheduler:
         lr_scheduler = ReduceLROnPlateau(optimizerG, 'min', factor=np.sqrt(0.1), patience=5, min_lr=5e-7)
     
@@ -251,28 +276,54 @@ def init_generator(opt, path_to_chkpt):
         GF.apply(init_weights)
         GE.apply(init_weights)
         GD.apply(init_weights)
+        
+        save_generator(opt.parallel, 0, [],GE, GF, GD, 0, optimizerG, path_to_chkpt)
+        print('...Done')
 
-        print('Initiating new checkpoint...')
-        if opt.parallel:
-            torch.save({
-                    'epoch': 0,
-                    'lossesG': [],
-                    'GE_state_dict': GE.module.state_dict(),
-                    'GF_state_dict': GF.module.state_dict(),
-                    'GD_state_dict': GD.module.state_dict(),
-                    'i_batch': 0,
-                    'optimizerG': optimizerG.state_dict(),
-                    }, path_to_chkpt)
-        else:
-            torch.save({
-                    'epoch': 0,
-                    'lossesG': [],
-                    'GE_state_dict': GE.state_dict(),
-                    'GF_state_dict': GF.state_dict(),
-                    'GD_state_dict': GD.state_dict(),
-                    'i_batch': 0,
-                    'optimizerG': optimizerG.state_dict(),
-                    }, path_to_chkpt)
+    return GF, GE, GD, optimizerG
+
+def init_generator_with_occ(opt, path_to_chkpt):
+    image_nc = 3
+    structure_nc = 21
+    flow_layers = [2,3]
+    if opt.use_parsing:
+        structure_nc += 20
+    if opt.use_simmap:
+        image_nc += 13
+    from model.pyramid_flow_generator_with_occlu_attn import FlowGenerator
+    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GE = AppearanceEncoder(n_layers=opt.n_enc, inc=3, use_spectral_norm=opt.use_spectral_G)
+    # GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    
+    # if not opt.use_pose_decoder:
+    #     GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+    #         activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+    # else:
+    #     GD = PoseAwareAppearanceDecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+    #         activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+    GD = AppearanceDecoder(n_bottleneck_layers=opt.n_btn, n_decode_layers=opt.n_enc, norm_type=opt.norm_type, use_spectral_norm=opt.use_spectral_G)
+    if opt.parallel:
+        GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
+        GE = nn.DataParallel(GE)
+        GD = nn.DataParallel(GD)
+
+    GF = GF.to(device)
+    GE = GE.to(device)
+    GD = GD.to(device)
+
+    optimizerG = optim.Adam(params = list(GF.parameters()) + list(GE.parameters()) + list(GD.parameters()) ,
+                            lr=opt.lr,
+                            amsgrad=False)
+    if opt.use_scheduler:
+        lr_scheduler = ReduceLROnPlateau(optimizerG, 'min', factor=np.sqrt(0.1), patience=5, min_lr=5e-7)
+    
+    if not os.path.isfile(path_to_chkpt):
+        # initiate checkpoint if inexist
+        GF.apply(init_weights)
+        GE.apply(init_weights)
+        GD.apply(init_weights)
+        
+        save_generator(opt.parallel, 0, [],GE, GF, GD, 0, optimizerG, path_to_chkpt)
         print('...Done')
 
     return GF, GE, GD, optimizerG
@@ -691,6 +742,170 @@ def train(opt, exp_name):
   
     writer.close()
 
+def train_flow_net_with_occ(opt, exp_name):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
+    
+    '''Set logging,checkpoint,vis dir'''
+    path_to_ckpt_dir, path_to_log_dir, path_to_visualize_dir = make_ckpt_log_vis_dirs(opt, exp_name)
+    path_to_chkpt = path_to_ckpt_dir + 'flow_model_weights.tar' 
+
+    '''save parser'''
+    save_parser(opt, path_to_ckpt_dir+'config.json')
+    
+    '''Create dataset and dataloader'''
+    dataset = make_dataset(opt)
+    dataloader = make_dataloader(opt, dataset)
+
+    '''Create Model'''
+    GF, GE, GD, optimizerG = init_generator_with_occ(opt, path_to_chkpt)
+    
+    '''Loading from past checkpoint'''
+    checkpoint = torch.load(path_to_chkpt, map_location=cpu)
+    if opt.parallel:
+        GF.module.load_state_dict(checkpoint['GF_state_dict'], strict=False)
+    else:
+        GF.load_state_dict(checkpoint['GF_state_dict'], strict=False)
+    epochCurrent = checkpoint['epoch']
+    lossesG = checkpoint['lossesG']
+    i_batch_current = checkpoint['i_batch']
+    i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
+    optimizerG.load_state_dict(checkpoint['optimizerG'])
+    _freeze(GE)
+    _freeze(GD)
+    GE = VGG19().to(device)
+    '''create tensorboard writter'''
+    writer = create_writer(path_to_log_dir)
+    
+    '''Losses'''
+    criterionG = LossG(device=device)
+    criterionL1 = nn.L1Loss().to(device)
+    criterionCorrectness = PerceptualCorrectness().to(device)
+    criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+
+    save_freq = 1
+
+    """ Training start """
+    for epoch in range(epochCurrent, opt.epochs):
+        if epoch >= 100:
+            save_freq=5
+        if epoch >= 500:
+            save_freq=10
+        if epoch > epochCurrent:
+            i_batch_current = 0
+        epoch_loss_G = 0
+        pbar = tqdm(dataloader, leave=True, initial=0)
+        pbar.set_description('[{0:>4}/{1:>4}], lr-{2}'.format(epoch,opt.epochs,optimizerG.param_groups[0]['lr']))
+        
+        for i_batch, batch_data in enumerate(pbar, start=0):
+            ref_xs = batch_data['ref_xs']
+            ref_ys = batch_data['ref_ys']
+            g_x = batch_data['g_x']
+            g_y = batch_data['g_y']
+            assert(len(ref_xs)==len(ref_ys))
+            assert(len(ref_xs)==opt.K)
+            for i in range(len(ref_xs)):
+                ref_xs[i] = ref_xs[i].to(device)
+                ref_ys[i] = ref_ys[i].to(device)
+
+            g_x = g_x.to(device) # [B, 3, 256, 256]
+            g_y = g_y.to(device) # [B, 20, 256, 256]
+            
+            flows, flow_ones, masks, xfs = [], [], [], []
+            flows_down,masks_down, xfs_warp = [], [], []
+            g_xf = GE(g_x)['relu4_1']
+            for k in range(0, opt.K):
+                flow_ks, mask_ks, _ = GF(ref_xs[k], ref_ys[k], g_y) # 32, 64
+                flow_k = flow_ks[1]
+                # print(flow_k.shape)
+                mask_k = mask_ks[1]
+                # print(mask_k.shape)
+
+                xf_k = GE(ref_xs[k])['relu4_1']
+                # print(xf_k.shape)
+                flow_k_down = F.interpolate(flow_k * xf_k.shape[2] / flow_k.shape[2], size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
+
+                mask_k_down = F.interpolate(mask_k, size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
+                xf_k_warp = warp_flow(xf_k, flow_k_down, align_corners=opt.align_corner)
+
+                flows += [flow_ks]
+                flow_ones += [flow_k ]
+                masks += [mask_k]
+                # attns += [mask_k]
+                xfs += [xf_k]
+                flows_down += [flow_k_down]
+                masks_down += [mask_k_down]
+                xfs_warp += [xf_k_warp]
+            
+            '''normalize masks to sum to 1'''
+            mask_cat = torch.cat(masks_down, dim=1)
+            if opt.mask_norm_type == 'softmax':
+                mask_normed = F.softmax(mask_cat, dim=1) # pixel wise sum to 1
+            else:
+                eps = 1e-12
+                mask_normed = mask_cat / (torch.sum(mask_cat, dim=1).unsqueeze(1)+eps) # pixel wise sum to 1
+
+            xfs_warp_masked = None
+            xf_merge = None
+            for k in range(0, opt.K):
+                mask_normed_k_down = mask_normed[:,k:k+1,...]
+
+                if xfs_warp_masked is None:
+                    xfs_warp_masked = [xfs_warp[k] * mask_normed_k_down]
+                    xf_merge = xfs_warp[k] * mask_normed_k_down
+                else:
+                    xfs_warp_masked.append(xfs_warp[k] * mask_normed_k_down)
+                    xf_merge += xfs_warp[k] * mask_normed_k_down
+
+            # x_hat = GD(xf_merge)
+            # x_hat =  warp_flow(F.interpolate(ref_xs[k], size=flow_k.shape[2:], mode='bilinear',align_corners=opt.align_corner), flow_k, align_corners=opt.align_corner)
+            # x_hat = F.interpolate(x_hat, size=g_x.shape[2:],mode='bilinear',align_corners=opt.align_corner)
+            down_ref_xk = F.interpolate(ref_xs[k], size=flow_k.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+            x_hat_down =  warp_flow(down_ref_xk, flow_k, align_corners=opt.align_corner)
+            x_hat = F.interpolate(x_hat_down, size=ref_xs[k].shape[2:], mode='bilinear', align_corners=opt.align_corner)
+            loss_correct=0
+            for k in range(opt.K):
+                loss_correct += criterionCorrectness(g_x, ref_xs[k], flows[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear)
+                # loss_correct += criterionL1(xfs_warp[k], g_xf)
+            loss_correct = loss_correct/opt.K * 5
+            lossG = loss_correct
+            writer.add_scalar('{0}/loss_correct'.format(opt.phase), loss_correct.item(), global_step=i_batch_total, walltime=None)
+            
+            loss_regular = 0
+            if opt.use_flow_reg:
+                for k in range(opt.K):
+                    loss_regular += criterionReg(flows[k])
+                
+                loss_regular = loss_regular / opt.K * 0.0025
+            
+                lossG += loss_regular
+                writer.add_scalar('{0}/loss_regular'.format(opt.phase), loss_regular.item(), global_step=i_batch_total, walltime=None)
+            optimizerG.zero_grad()
+            lossG.backward(retain_graph=False)
+            optimizerG.step()
+            epoch_loss_G += lossG.item()
+            epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
+            i_batch_total += 1
+            
+            if opt.use_flow_reg:
+                post_fix_str = 'Epoch_loss=%.3f, G=%.3f, Cor=%.3f, Reg=%.3f'%(epoch_loss_G_moving, lossG.item(), loss_correct.item(), loss_regular.item())
+            else:
+                post_fix_str = 'Epoch_loss=%.3f, G=%.3f, Cor=%.3f'%(epoch_loss_G_moving, lossG.item(), loss_correct.item())
+            pbar.set_postfix_str(post_fix_str)
+            if opt.use_scheduler:
+                lr_scheduler.step(epoch_loss_G_moving)
+            lossesG.append(lossG.item())
+            
+            if i_batch % opt.img_save_freq == 0:    
+                final_img,_,_ = get_visualize_result(opt, ref_xs, ref_ys,None, g_x, g_y,None,None, g_xf, x_hat,\
+                    flow_ones, F.interpolate(mask_normed, size=g_x.shape[2:], mode='bilinear',align_corners=opt.align_corner), xfs, xfs_warp, xfs_warp_masked)
+                
+                plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
+
+            if i_batch % opt.model_save_freq == 0:
+                path_to_save_G = path_to_ckpt_dir + 'epoch_{}_batch_{}_G.tar'.format(epoch, i_batch)
+                save_generator(opt.parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG, path_to_save_G)
+
+    writer.close()
 
 def test(opt):
     from util.io import load_image, load_skeleton, load_parsing, transform_image
@@ -838,13 +1053,14 @@ if __name__ == "__main__":
     set_random_seed(opt.seed)
     
     if opt.phase == 'train':
-        # today = datetime.today().strftime("%Y%m%d")
-        today = '20201123'
+        today = datetime.today().strftime("%Y%m%d")
+        # today = '20201123'
         # fashion_v0_flow_pretrain_GLFA_lsGAN_1shot_20201123
-        experiment_name = 'fashion_v{0}_lsGAN_{1}shot_{2}'.format(opt.id,opt.K, today)
+        experiment_name = 'fashion_pretrain_flow_v{0}_{1}shot_{2}'.format(opt.id,opt.K, today)
         print(experiment_name)
         # train(opt, experiment_name)
-        train_flow_net(opt, experiment_name)
+        # train_flow_net(opt, experiment_name)
+        train_flow_net_with_occ(opt, experiment_name)
     else:
         test(opt)
 

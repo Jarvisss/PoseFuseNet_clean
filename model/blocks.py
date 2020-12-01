@@ -342,6 +342,29 @@ class ResBlockEncoder(nn.Module):
         out = self.model(x) + self.shortcut(x)
         return out
 
+class EncoderBlock(nn.Module):
+    '''d'''
+    def __init__(self, input_nc, output_nc, norm_layer=nn.BatchNorm2d, nonlinearity=nn.LeakyReLU(),
+                 use_spect=False):
+        super(EncoderBlock, self).__init__()
+
+
+        kwargs_down = {'kernel_size': 4, 'stride': 2, 'padding': 1}
+        kwargs_fine = {'kernel_size': 3, 'stride': 1, 'padding': 1}
+        
+        conv1 = spectral_norm(nn.Conv2d(input_nc,  output_nc, **kwargs_down), use_spect)
+        conv2 = spectral_norm(nn.Conv2d(output_nc, output_nc, **kwargs_fine), use_spect)
+
+        if type(norm_layer) == type(None):
+            self.model = nn.Sequential(nonlinearity, conv1, nonlinearity, conv2,)
+        else:
+            self.model = nn.Sequential(norm_layer(input_nc),  nonlinearity, conv1, 
+                                       norm_layer(output_nc), nonlinearity, conv2,)
+
+    def forward(self, x):
+        out = self.model(x)
+        return out
+
 
 class ResBlockDown(nn.Module):
     def __init__(self, in_channel, out_channel, conv_size=3, padding_size=1, use_spectral_norm=False):
@@ -384,6 +407,66 @@ class ResBlockDown(nn.Module):
         
         return out
 
+class ResBlockDecoder(nn.Module):
+    """
+    Define a decoder block
+    """
+    def __init__(self, input_nc, output_nc, hidden_nc=None, norm_layer=nn.BatchNorm2d, nonlinearity= nn.LeakyReLU(),
+                 use_spect=False):
+        super(ResBlockDecoder, self).__init__()
+
+        hidden_nc = input_nc if hidden_nc is None else hidden_nc
+
+        conv1 = spectral_norm(nn.Conv2d(input_nc, hidden_nc, kernel_size=3, stride=1, padding=1), use_spect)
+        conv2 = spectral_norm(nn.ConvTranspose2d(hidden_nc, output_nc, kernel_size=3, stride=2, padding=1, output_padding=1), use_spect)
+        bypass = spectral_norm(nn.ConvTranspose2d(input_nc, output_nc, kernel_size=3, stride=2, padding=1, output_padding=1), use_spect)
+
+        if type(norm_layer) == type(None):
+            self.model = nn.Sequential(nonlinearity, conv1, nonlinearity, conv2,)
+        else:
+            self.model = nn.Sequential(norm_layer(input_nc), nonlinearity, conv1, norm_layer(hidden_nc), nonlinearity, conv2,)
+
+        self.shortcut = nn.Sequential(bypass)
+
+    def forward(self, x):
+        out = self.model(x) + self.shortcut(x)
+        return out
+
+class ResBlock(nn.Module):
+    """
+    Define an Residual block for different types
+    """
+    def __init__(self, input_nc, output_nc=None, hidden_nc=None, norm_layer=nn.BatchNorm2d, nonlinearity= nn.LeakyReLU(),
+                learnable_shortcut=False, use_spect=False, use_coord=False):
+        super(ResBlock, self).__init__()
+
+        hidden_nc = input_nc if hidden_nc is None else hidden_nc
+        output_nc = input_nc if output_nc is None else output_nc
+        self.learnable_shortcut = True if input_nc != output_nc else learnable_shortcut
+
+        kwargs = {'kernel_size': 3, 'stride': 1, 'padding': 1}
+        kwargs_short = {'kernel_size': 1, 'stride': 1, 'padding': 0}
+
+        conv1 = coord_conv(input_nc, hidden_nc, use_spect, use_coord, **kwargs)
+        conv2 = coord_conv(hidden_nc, output_nc, use_spect, use_coord, **kwargs)
+
+        if type(norm_layer) == type(None):
+            self.model = nn.Sequential(nonlinearity, conv1, nonlinearity, conv2,)
+        else:
+            self.model = nn.Sequential(norm_layer(input_nc), nonlinearity, conv1, 
+                                       norm_layer(hidden_nc), nonlinearity, conv2,)
+
+        if self.learnable_shortcut:
+            bypass = coord_conv(input_nc, output_nc, use_spect, use_coord, **kwargs_short)
+            self.shortcut = nn.Sequential(bypass,)
+
+
+    def forward(self, x):
+        if self.learnable_shortcut:
+            out = self.model(x) + self.shortcut(x)
+        else:
+            out = self.model(x) + x
+        return out
 
 class ResBlockDownFirst(nn.Module):
     def __init__(self, in_channel, out_channel, conv_size=3, padding_size=1):
@@ -500,34 +583,34 @@ def adaIN(feature, mean_style, std_style, eps = 1e-5):
     return adain
 
 
-class ResBlock(nn.Module):
-    def __init__(self, in_channel):
-        super(ResBlock, self).__init__()
+# class ResBlock(nn.Module):
+#     def __init__(self, in_channel):
+#         super(ResBlock, self).__init__()
         
-        #using no ReLU method
+#         #using no ReLU method
         
-        #general
-        self.relu = nn.LeakyReLU(inplace = False)
+#         #general
+#         self.relu = nn.LeakyReLU(inplace = False)
         
-        #left
-        self.conv1 = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 3, padding = 1))
-        self.conv2 = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 3, padding = 1))
+#         #left
+#         self.conv1 = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 3, padding = 1))
+#         self.conv2 = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 3, padding = 1))
         
-    def forward(self, x, psi_slice):
-        C = psi_slice.shape[1]
+#     def forward(self, x, psi_slice):
+#         C = psi_slice.shape[1]
         
-        res = x
+#         res = x
         
-        out = adaIN(x, psi_slice[:, 0:C//4, :], psi_slice[:, C//4:C//2, :])
-        out = self.relu(out)
-        out = self.conv1(out)
-        out = adaIN(out, psi_slice[:, C//2:3*C//4, :], psi_slice[:, 3*C//4:C, :])
-        out = self.relu(out)
-        out = self.conv2(out)
+#         out = adaIN(x, psi_slice[:, 0:C//4, :], psi_slice[:, C//4:C//2, :])
+#         out = self.relu(out)
+#         out = self.conv1(out)
+#         out = adaIN(out, psi_slice[:, C//2:3*C//4, :], psi_slice[:, 3*C//4:C, :])
+#         out = self.relu(out)
+#         out = self.conv2(out)
         
-        out = out + res
+#         out = out + res
         
-        return out
+#         return out
         
 class ResBlockD(nn.Module):
     def __init__(self, in_channel):
