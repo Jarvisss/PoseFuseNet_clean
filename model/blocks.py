@@ -71,16 +71,14 @@ def spectral_norm(module, use_spect=True):
         return module
 
 # grid:(b, 2, H, W) [-1,1]
-def gen_uniform_grid(x):
-    [b, c, h, w] = x.shape
+def gen_uniform_grid(source):
+    [b, _, h, w] = source.shape
     # mesh grid
-    xx = x.new_tensor(range(w)).view(1,-1).repeat(h,1)
-    yy = x.new_tensor(range(h)).view(-1,1).repeat(1,w)
-    xx = xx.view(1,1,h,w).repeat(b,1,1,1)
-    yy = yy.view(1,1,h,w).repeat(b,1,1,1)
-    grid = torch.cat((xx,yy), dim=1).float()
-    grid[:,0,:,:] = 2.0*grid[:,0,:,:]/max(w-1,1) - 1.0
-    grid[:,1,:,:] = 2.0*grid[:,1,:,:]/max(h-1,1) - 1.0
+    x = torch.arange(w).view(1, -1).expand(h, -1).type_as(source).float() / (w-1)
+    y = torch.arange(h).view(-1, 1).expand(-1, w).type_as(source).float() / (h-1)
+    grid = torch.stack([x,y], dim=0)
+    grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
+    grid = 2*grid - 1
     return grid
 
 def warp_flow(source, flow, align_corners=True, mode='bilinear', mask=None, mask_value=-1):

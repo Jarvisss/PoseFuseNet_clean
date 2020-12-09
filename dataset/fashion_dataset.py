@@ -30,13 +30,14 @@ class FashionDataset(data.Dataset):
     @ path_to_test_anno
         the path to test image keypoint annotations
     """
-    def __init__(self, phase,  path_to_train_tuples, path_to_test_tuples, path_to_train_imgs_dir, path_to_train_anno, path_to_test_imgs_dir, path_to_test_anno, opt, load_size=256, pose_scale=255.0):
+    def __init__(self, phase,  path_to_train_tuples, path_to_test_tuples, path_to_train_imgs_dir, path_to_train_anno, path_to_test_imgs_dir, path_to_test_anno, opt,path_to_train_parsings_dir=None,path_to_test_parsings_dir=None, load_size=256, pose_scale=255.0):
         super(FashionDataset, self).__init__()
         
         self._is_train = phase == 'train'
         self._train_tuples = pd.read_csv(path_to_train_tuples)
         self._train_anno = pd.read_csv(path_to_train_anno, sep=':')
         self._train_img_dir = path_to_train_imgs_dir
+        self._train_parsing_dir = path_to_train_parsings_dir
         print ("--------------- Dataset Info: ---------------")
         print ("Phase: %s" % phase)
         print ("Number of tuples train: %s" % len(self._train_tuples))
@@ -44,6 +45,7 @@ class FashionDataset(data.Dataset):
         self._test_tuples = pd.read_csv(path_to_test_tuples)
         self._test_anno = pd.read_csv(path_to_test_anno, sep=':')
         self._test_img_dir = path_to_test_imgs_dir
+        self._test_parsing_dir = path_to_test_parsings_dir
         print ("Number of tuples test: %s" % len(self._test_tuples))
         # self._test_tuples = pd.read_csv(path_to_train_tuples)
         # self._test_anno = pd.read_csv(path_to_test_anno, sep=':')
@@ -51,6 +53,8 @@ class FashionDataset(data.Dataset):
         # print ("Number of tuples test: %s" % len(self._test_tuples))        
 
         self._nb_inputs = opt.K
+        if opt.use_parsing:
+            self._parsing_categories = opt.categories
         self._annotation_file = pd.concat([self._train_anno, self._test_anno], axis=0, ignore_index=True)
         self._annotation_file = self._annotation_file.set_index('name')
         print ("Number of total images: %s" % len(self._annotation_file))
@@ -64,15 +68,17 @@ class FashionDataset(data.Dataset):
         self.load_size = (load_size, load_size)
         self.anno_size = tuple(opt.anno_size) if opt.anno_size else (load_size,load_size)
         self.no_bone_RGB = False
-        self.angle = (-10, 10)
-        self.shift = (30, 3)
-        self.scale = (0.8, 1.2)        
-        # self.angle = None
-        # self.shift = None
-        # self.scale = None
+        # self.angle = (-10, 10)
+        # self.shift = (30, 3)
+        # self.scale = (0.8, 1.2)        
+        self.angle = None
+        self.shift = None
+        self.scale = None
         self.img_size = (0,0)
         self.pose_scale = pose_scale
         self.align_corner = opt.align_corner
+        self.use_parsing = opt.use_parsing
+        self.affine_param = self.getRandomAffineParam()
 
 
 
@@ -139,19 +145,24 @@ class FashionDataset(data.Dataset):
         
         return Bi,torch.Tensor(kp_array.transpose())
     
-    def load_parsing(self, parsing_path):
+    def load_parsing(self, tuple_df, direction='' ,categories=8, affine=None):
+        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)]
+        if self._is_train: 
+            parsing_path = os.path.join(self._train_parsing_dir, tuple_df[direction].replace('.jpg','_merge.png'))
+        else:
+            parsing_path = os.path.join(self._test_parsing_dir, tuple_df[direction].replace('.jpg','_merge.png'))
         parsing_img = Image.open(parsing_path)
         parsing_img = np.array(self.transform_image(parsing_img, self.load_size, affine=self.affine_param, fillWhiteColor=False, toTensor=False, normalize=False)) # 0-19 one channel map
         # [H W 1 ] -> [H W 20]
-        parsing_bin_map = np.stack((parsing_img,)*20, axis=2)
-        
+        parsing_bin_map = np.stack((parsing_img,)*categories, axis=2)
+        # print(parsing_bin_map.shape)
         # to 20 channel binary map
-        for i in range(20):
+        for i in range(categories):
             parsing_bin_map[:,:, i] = (parsing_img == i).astype(np.uint8) * 255 
         
         # [H W 20] -> [20 H W]
+        # [0-255] -> [0-1]
         parsing_bin_map = F.to_tensor(parsing_bin_map) 
-
         return parsing_bin_map
 
     '''Calculate shoulder direction vector cosine similarity
@@ -260,6 +271,10 @@ class FashionDataset(data.Dataset):
 
         ref_skeletons = [self.load_skeleton(tuple_df, from_idx) for from_idx in ['from_'+str(i) for i in range(self._nb_inputs)]]
         g_skeleton = self.load_skeleton(tuple_df, 'to')
+
+        ref_parsings = [self.load_parsing(tuple_df, from_idx, categories=self._parsing_categories) for from_idx in ['from_'+str(i) for i in range(self._nb_inputs)]] if self.use_parsing else None
+        g_parsing = self.load_parsing(tuple_df, 'to', categories=self._parsing_categories) if self.use_parsing else None
+
         # print('get image item time:%.3f'%(image_end-start))
         ref_ys = [ref_skeletons[i][0] for i in range(len(ref_skeletons))]
         ref_js = [ref_skeletons[i][1] for i in range(len(ref_skeletons))]
@@ -274,7 +289,10 @@ class FashionDataset(data.Dataset):
 
         end = time.time()
         # print('get item time:%.3f'%(end-start))
-        return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'g_x':g_x, 'g_y':g_y, 'froms':from_names, 'to':to_name}
+        if self.use_parsing:
+            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'ref_ps':ref_parsings, 'g_x':g_x, 'g_y':g_y,  'g_p':g_parsing, 'froms':from_names, 'to':to_name}
+        else:
+            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'g_x':g_x, 'g_y':g_y, 'froms':from_names, 'to':to_name}
 
     def get_affine_matrix(self, center, angle, translate, scale, shear):
         matrix_inv = self.get_inverse_affine_matrix(center, angle, translate, scale, shear)

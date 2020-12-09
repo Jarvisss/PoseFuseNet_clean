@@ -4,17 +4,18 @@ import torch
 import torch.nn as nn 
 
 '''
-Input source feature and target feature at level L, L assume to be 4
+Input source feature and target feature at level L, L assume to be 2
 '''
-class FlowGenerator(nn.Module):
-    """Flow Generator
+class PartFlowGenerator(nn.Module):
+    """Part Flow Generator
     """
-    def __init__(self, image_nc=3, structure_nc=21, n_layers=5, flow_layers=[2,3], ngf=32, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True):
-        super(FlowGenerator, self).__init__()
+    def __init__(self, image_nc=3, structure_nc=21,parsing_nc=8, n_layers=5, flow_layers=[2,3], ngf=32, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True):
+        super(PartFlowGenerator, self).__init__()
         norm_layer = get_norm_layer(norm_type=norm_type)
         nonlinearity = get_nonlinearity_layer(activation_type=activation)
         self.image_nc = image_nc
         self.structure_nc = structure_nc
+        self.parsing_nc = parsing_nc
         self.ngf = ngf
         self.norm_type = norm_type
 
@@ -27,7 +28,7 @@ class FlowGenerator(nn.Module):
 
 
     def _make_layers(self, ngf, max_nc, norm_layer, nonlinearity, use_spectral_norm):
-        inc = self.image_nc + self.structure_nc * 2
+        inc = self.image_nc + self.structure_nc * 2 + self.parsing_nc * 2
         self.block0 = ResBlockEncoder(inc, ngf, ngf, norm_layer, nonlinearity, use_spectral_norm)
         mult = 1
         for i in range(1, self.encoder_layers):
@@ -67,11 +68,11 @@ class FlowGenerator(nn.Module):
     
     '''Get flow and mask at certain layer, [32,32,128] [64,64,64]
     '''
-    def forward(self, image1, pose1, pose2, sim_map=None):
+    def forward(self, image1, pose1,parsing_1, pose2,parsing_2, sim_map=None):
         if sim_map is None:
-            x_in = torch.cat((image1, pose1, pose2), dim=1) # (43, 256, 256)
+            x_in = torch.cat((image1, pose1,parsing_1, pose2, parsing_2), dim=1) # (43, 256, 256)
         else:
-            x_in = torch.cat((image1, pose1, pose2, sim_map), dim=1) # (43+13, 256, 256)
+            x_in = torch.cat((image1, pose1,parsing_1, pose2, parsing_2, sim_map), dim=1) # (43+13, 256, 256)
 
         flow_fields=[]
         masks=[]

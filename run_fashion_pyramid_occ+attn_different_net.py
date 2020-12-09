@@ -24,7 +24,7 @@ from util.vis_util import visualize_feature, visualize_feature_group, visualize_
 from torch.optim.lr_scheduler import MultiStepLR, ReduceLROnPlateau
 
 from dataset.fashion_dataset import FashionDataset
-from loss.loss_generator import PerceptualCorrectness, LossG, MultiAffineRegularizationLoss
+from loss.loss_generator import PerceptualCorrectness, LossG, MultiAffineRegularizationLoss, FlowAttnLoss
 from loss.externel_functions import AdversarialLoss
 
 from tqdm import tqdm
@@ -115,6 +115,7 @@ def get_parser():
 
     '''Experiment options'''
     parser.add_argument('--use_attn', action='store_true', help='use attention for multi-view parsing generation')
+    parser.add_argument('--attn_avg', action='store_true', help='use average instead of learnt attention')
     parser.add_argument('--mask_sigmoid', action='store_true', help='Use Sigmoid() as mask output layer or not')
     parser.add_argument('--mask_norm_type', type=str, default='softmax', help='softmax | divsum')
 
@@ -124,12 +125,15 @@ def get_parser():
     parser.add_argument('--G_use_resample', action='store_true', help='use gaussian sampling in the target decoder')
     parser.add_argument('--use_correctness', action='store_true', help='use sample correct loss')
     parser.add_argument('--use_flow_reg', action='store_true', help='use flow regularization')
+    parser.add_argument('--use_flow_attn_loss', action='store_true', help='use flow attention loss')
 
     parser.add_argument('--lambda_style', type=float, default=500.0, help='style loss')
     parser.add_argument('--lambda_content', type=float, default=0.5, help='content loss')
     parser.add_argument('--lambda_rec', type=float, default=5.0, help='L1 loss')
     parser.add_argument('--lambda_adv', type=float, default=2.0, help='GAN loss weight')
     parser.add_argument('--lambda_correctness', type=float, default=5.0, help='sample correctness weight')
+    parser.add_argument('--lambda_flow_reg', type=float, default=0.0025, help='regular sample loss weight')
+    parser.add_argument('--lambda_flow_attn', type=float, default=1, help='regular sample loss weight')
     opt = parser.parse_args()
     return opt   
 
@@ -177,8 +181,8 @@ def make_dataset(opt):
             phase = opt.phase,
             path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-train.csv'), 
             path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-test.csv'), 
-            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
-            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
+            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train_256/'), 
+            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
             opt=opt)
@@ -541,6 +545,7 @@ def train(opt, exp_name):
     criterion_GAN = AdversarialLoss(type='lsgan').to(device)
     criterionCorrectness = PerceptualCorrectness().to(device)
     criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+    criterionFlowAttn = FlowAttnLoss().to(device)
 
     print('-------Training Start--------')
     """ Training start """
@@ -585,9 +590,14 @@ def train(opt, exp_name):
                 attns += [attn_ks]
                 xfs += [xf_ks]
             
+            # 如果是平均，则每个attn的值都为1，然后做softmax变为1/K
+            if opt.attn_avg:
+                for k in range(0, opt.K):
+                    for i in range(0, len(attns[k])):
+                        attns[k][i] = torch.ones_like(attns[k][i])
+            
             # 使每个位置，K个attention的和为1
             # mask_norm: [tensor[K,32,32] tensor[K,64,64]]
-            
             attn_norm = []
             for i in range(len(attns[0])):
                 temp = []
@@ -602,6 +612,9 @@ def train(opt, exp_name):
                 for i in range(0, len(attn_norm)):
                     temp += [attn_norm[i][:,k:k+1,...]] # += [1,32,32]
                 attn_norm_trans += [temp]
+
+            
+
 
             ### GD input is:
             # flows: K * [B,2,32,32][B,2,64,64]
@@ -671,11 +684,19 @@ def train(opt, exp_name):
                 for k in range(opt.K):
                     loss_regular += criterionReg(flows[k])
                 
-                loss_regular = loss_regular / opt.K * 0.0025
+                loss_regular = loss_regular / opt.K * opt.lambda_flow_reg
             
                 lossG += loss_regular
                 writer.add_scalar('{0}/loss_regular'.format(opt.phase), loss_regular.item(), global_step=i_batch_total, walltime=None)
-
+            
+            if opt.use_flow_attn_loss:
+                loss_flow_attn = 0 #  sum_i(w_i(P_G-P_i)), wi = exp(-attn)
+                for k in range(0, opt.K):
+                    
+                    loss_flow_attn += criterionFlowAttn(g_x, ref_xs[k], flows[k], attn_norm_trans[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness) #  
+                loss_flow_attn = loss_flow_attn / opt.K * opt.lambda_flow_attn
+                lossG += loss_flow_attn
+                writer.add_scalar('{0}/loss_flow_attn'.format(opt.phase), loss_flow_attn.item(), global_step=i_batch_total, walltime=None)
 
             lossG.backward(retain_graph=False)
             optimizerG.step()
@@ -690,6 +711,8 @@ def train(opt, exp_name):
                 post_fix_str += ', G_cor=%.3f'%(loss_correct.item())
             if opt.use_flow_reg:
                 post_fix_str += ', G_reg=%.3f'%(loss_regular.item())
+            if opt.use_flow_attn_loss:
+                post_fix_str += ', G_flo=%.3f'%(loss_flow_attn.item())
             
             pbar.set_postfix_str(post_fix_str)
             if opt.use_scheduler:
@@ -697,10 +720,11 @@ def train(opt, exp_name):
             lossesG.append(lossG.item())
             
             if i_batch % opt.img_save_freq == 0:
-                final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x, x_hat, g_y,None,None,\
-                    flows, attn_norm_trans,masks, xfs, gf)
+                full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
+                    ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
+                        gp=None,gp_hat=None,flows=flows, masks_normed=attn_norm_trans, occlusions=masks, ref_features=xfs, g_features=gf)
                 
-                plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
+                plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), full_img)
 
             if i_batch % opt.model_save_freq == 0:
                 path_to_save_G = path_to_ckpt_dir + 'epoch_{}_batch_{}_G.tar'.format(epoch, i_batch)
@@ -711,10 +735,11 @@ def train(opt, exp_name):
         save_generator(opt.parallel, epoch+1, lossesG, GE, GF, GD,GP, i_batch, optimizerG, path_to_chkpt_G)
         save_discriminator(opt.parallel, D, optimizerD, path_to_chkpt_D)
         '''save image result'''
-        final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x,x_hat, g_y,None,None, \
-                    flows, attn_norm_trans,masks, xfs, gf)
+        full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
+            ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
+                gp=None,gp_hat=None,flows=flows, masks_normed=attn_norm_trans, occlusions=masks, ref_features=xfs, g_features=gf)
 
-        plt.imsave(os.path.join(path_to_visualize_dir,"epoch_latest.png"), final_img)
+        plt.imsave(os.path.join(path_to_visualize_dir,"epoch_latest.png"), full_img)
         
             
     writer.close()
@@ -734,8 +759,11 @@ def test(opt):
     
     path_to_chkpt_G = path_to_ckpt_dir + '{0}.tar'.format(opt.test_ckpt_name) 
     test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    test_result_eval_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot_eval/'.format(experiment_name, opt.test_ckpt_name, opt.K)
     if not os.path.isdir(test_result_dir):
         os.makedirs(test_result_dir)
+    if not os.path.isdir(test_result_eval_dir):
+        os.makedirs(test_result_eval_dir)
     '''save parser'''
     
     '''Create dataset and dataloader'''
@@ -753,21 +781,25 @@ def test(opt):
 
     GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GP = PoseAttnFCNGenerator(structure_nc=structure_nc,n_layers=5, attn_layers= flow_layers, ngf=32, max_nc=256,norm_type=opt.norm_type, activation=opt.activation,use_spectral_norm=opt.use_spectral_G)
+
     if not opt.use_pose_decoder:
         GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
     else:
         GD = PoseAwareAppearanceDecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
-    
+
     if opt.parallel:
         GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
         GE = nn.DataParallel(GE)
         GD = nn.DataParallel(GD)
+        GP = nn.DataParallel(GP)
 
     GF = GF.to(device)
     GE = GE.to(device)
     GD = GD.to(device)
+    GP = GP.to(device)
     
     '''Loading from past checkpoint_G'''
     checkpoint_G = torch.load(path_to_chkpt_G, map_location=cpu)
@@ -775,14 +807,17 @@ def test(opt):
         GF.module.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
         GE.module.load_state_dict(checkpoint_G['GE_state_dict'], strict=False)
         GD.module.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
+        GP.module.load_state_dict(checkpoint_G['GP_state_dict'], strict=False)
     else:
         GF.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
         GE.load_state_dict(checkpoint_G['GE_state_dict'], strict=False)
         GD.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
+        GP.load_state_dict(checkpoint_G['GP_state_dict'], strict=False)
     epochCurrent = checkpoint_G['epoch']
     GF.train()
     GE.train()
     GD.train()
+    GP.train()
 
     '''Losses'''
     criterionG = LossG(device=device)
@@ -811,7 +846,7 @@ def test(opt):
         g_x = g_x.to(device) # [B, 3, 256, 256]
         g_y = g_y.to(device) # [B, 20, 256, 256]
         
-        flows, masks, xfs = [], [], []
+        flows, masks, attns, xfs = [], [], [], []
         flows_down,masks_down, xfs_warp = [], [], []
 
         # flows: K *[tensor[2,32,32] tensor[2,64,64]]
@@ -820,34 +855,38 @@ def test(opt):
         with torch.no_grad():
             gf = GE(g_x)[0:2]
         
-        
         for k in range(0, opt.K):
-            # get 2 flows and masks at two resolution 32, 64
-            flow_ks, mask_ks = GF(ref_xs[k], ref_ys[k], g_y)
-            
+            # get 2 flows, masks and attns at two resolution 32, 64
+            flow_ks, mask_ks, _ = GF(ref_xs[k], ref_ys[k], g_y)
+            # flow_ks, mask_ks = GF(ref_xs[k], ref_ys[k], g_y)
+            attn_ks = GP(ref_ys[k], g_y)
             # get 2 source features at resolution 32, 64
             xf_ks = GE(ref_xs[k])[0:2]
-
+            attns += [attn_ks]
             flows += [flow_ks]
             masks += [mask_ks]
             xfs += [xf_ks]
         
+        if opt.attn_avg:
+            for k in range(0, opt.K):
+                for i in range(0, len(attns[k])):
+                    attns[k][i] = torch.ones_like(attns[k][i])
         # 使每个位置，K个attention的和为1
         # mask_norm: [tensor[K,32,32] tensor[K,64,64]]
-        mask_norm = []
-        for i in range(len(masks[0])):
+        attn_norm = []
+        for i in range(len(attns[0])):
             temp = []
             for k in range(opt.K):
-                temp += [ masks[k][i] ]
-            mask_norm += [F.softmax(torch.cat(temp,dim=1), dim=1)]         
+                temp += [ attns[k][i] ]
+            attn_norm += [F.softmax(torch.cat(temp,dim=1), dim=1)]         
         
         # mask_norm_trans -> K *[tensor[1,32,32] tensor[1,64,64]]
-        mask_norm_trans = []
+        attn_norm_trans = []
         for k in range(0, opt.K):
             temp = []
-            for i in range(0, len(mask_norm)):
-                temp += [mask_norm[i][:,k:k+1,...]] # += [1,32,32]
-            mask_norm_trans += [temp]
+            for i in range(0, len(attn_norm)):
+                temp += [attn_norm[i][:,k:k+1,...]] # += [1,32,32]
+            attn_norm_trans += [temp]
 
         ### GD input is:
         # flows: K * [B,2,32,32][B,2,64,64]
@@ -863,9 +902,9 @@ def test(opt):
         # print('mask shape 1:',mask_norm_trans[0][0].shape)
         # print('mask shape 2:',mask_norm_trans[0][1].shape)
         if opt.use_pose_decoder:
-            x_hat = GD(g_y, xfs, flows, mask_norm_trans)
+            x_hat = GD(g_y, xfs, flows, masks, attn_norm_trans)
         else:
-            x_hat = GD(xfs, flows, mask_norm_trans)
+            x_hat = GD(xfs, flows, masks, attn_norm_trans)
         model_G_end = time.time()
         # print('model G time:%.3f'%(model_G_end-model_G_start))
         lossG_content, lossG_style, lossG_L1 = criterionG(g_x, x_hat)
@@ -883,8 +922,9 @@ def test(opt):
         pbar.set_postfix_str(post_fix_str)
         visual_start = time.time()
 
-        final_img,simp_img,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x, x_hat, g_y,None,None,\
-            flows, mask_norm_trans, xfs, gf)
+        full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
+                    ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
+                        gp=None,gp_hat=None,flows=flows, masks_normed=attn_norm_trans, occlusions=masks, ref_features=xfs, g_features=gf)
         visual_end = time.time()
         # print('visual time:%.3f'%(visual_end-visual_start))
         
@@ -896,8 +936,10 @@ def test(opt):
         test_name += str(to[0])
         from PIL import Image
         Image.fromarray(simp_img).save(os.path.join(test_result_dir,"{0}_simp.jpg".format(test_name)))
+        Image.fromarray(out_img).save(os.path.join(test_result_eval_dir,"{0}_vis.jpg".format(test_name)))
+
         if opt.output_all:
-            Image.fromarray(final_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
+            Image.fromarray(full_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
         save_end = time.time()
         # print('save time:%.3f'%(save_end-save_start))
         
@@ -912,7 +954,7 @@ if __name__ == "__main__":
     
     if opt.phase == 'train':
         today = datetime.today().strftime("%Y%m%d")
-        # today = '20201123'
+        today = '20201206'
         experiment_name = 'fashion_v{0}_lsGAN_{1}shot_{2}'.format(opt.id,opt.K, today)
         print(experiment_name)
         train(opt, experiment_name)

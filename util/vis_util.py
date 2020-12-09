@@ -285,7 +285,15 @@ def tensor2im(x, display_batch=0, is_parsing=False,is_mask=False, out_size=(256,
     tensor = x.clone()
     assert len(tensor.shape)==4
     channel = tensor.shape[1]
-    if channel == 3:
+    if is_parsing:
+        tensor = tensor.detach().to(cpu).numpy()
+        img = visualize_parsing(tensor, display_batch)
+        img = torch.from_numpy(img).to(device).float()
+    elif channel == 1 and is_mask:
+        tensor = F.interpolate(tensor, size=out_size, mode='bilinear',align_corners=True)
+        img = tensor[display_batch].permute(1,2,0)
+        img = torch.cat((img,)*3, dim=2) * 255.0
+    elif channel == 3:
         # image
         tensor = F.interpolate(tensor, size=out_size, mode='bilinear',align_corners=True)
         img = tensor[display_batch].permute(1,2,0)
@@ -293,14 +301,7 @@ def tensor2im(x, display_batch=0, is_parsing=False,is_mask=False, out_size=(256,
     elif channel == 21:
         # bone
         img = tensor[display_batch][-3:,...].permute(1,2,0) * 255.0
-    elif channel == 1 and is_parsing:
-        tensor = tensor.to(cpu).numpy()
-        img = visualize_parsing(tensor, display_batch)
-        img = torch.from_numpy(img).to(device).float()
-    elif channel == 1 and is_mask:
-        tensor = F.interpolate(tensor, size=out_size, mode='bilinear',align_corners=True)
-        img = tensor[display_batch].permute(1,2,0)
-        img = torch.cat((img,)*3, dim=2) * 255.0
+    
     elif channel >= 32:
         # feature map
         img = visualize_feature(tensor, display_batch, out_size)
@@ -369,8 +370,9 @@ def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp
     
     visual_ref_xs_tensor = torch.cat(visual_ref_xs, dim=1)
     simp_img = torch.cat((visual_ref_xs_tensor,visual_out,visual_g_x),dim=1).type(torch.uint8).to(cpu).numpy()
+    out_img = visual_out.type(torch.uint8).to(cpu).numpy()
     if not opt.output_all and not opt.phase=='train':
-        return None, simp_img, None
+        return None, simp_img, out_img
 
     visual_feats = [0] * K * layers
     visual_warp_feats = [0] * K * layers
@@ -442,7 +444,7 @@ def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp
         visual_occlusionss = torch.cat(visual_occlusionss, dim=0)
         # print(visual_occlusionss.shape)
 
-        ref[k] = torch.cat((visual_ref_xs[k], visual_ref_ys[k], visual_features,visual_warp_features, white), dim=0)
+        ref[k] = torch.cat((visual_ref_xs[k], visual_ref_ys[k], visual_features,visual_warp_features, visual_ref_ps[k]), dim=0)
         if occlusions is None:
             feat[k] = torch.cat((white,white,visual_maskss, visual_masked_features, white ),dim=0)
         else:
@@ -456,7 +458,7 @@ def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp
 
     final_img = torch.cat((refs, feats, out_col,gt_col), dim=1)
     final_img = final_img.type(torch.uint8).to(cpu).numpy()
-    return final_img, simp_img, None
+    return final_img, simp_img, out_img
     
     # attns = torch.cat((final_img[256:512,256*K:256*K*2], white,white ),dim=1)
     # ys = torch.cat((final_img[256:512,0:256*K],g_y,g_y), dim=1)

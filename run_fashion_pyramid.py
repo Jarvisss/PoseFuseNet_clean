@@ -100,9 +100,6 @@ def get_parser():
     parser.add_argument('--activation', type=str, default='LeakyReLU', help='"ReLU" or "LeakyReLU"')
     parser.add_argument('--use_pose_decoder', action='store_true', help='use pose in the target decoder')
 
-    parser.add_argument('--use_spectral_G', action='store_true', help='open this if use spectral normalization in generator')
-    parser.add_argument('--use_spectral_D', action='store_true', help='open this if use spectral normalization in discriminator')
-
 
     '''Test options'''
     # if --test is open
@@ -558,8 +555,11 @@ def test(opt):
     
     path_to_chkpt_G = path_to_ckpt_dir + '{0}.tar'.format(opt.test_ckpt_name) 
     test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    test_result_eval_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot_eval/'.format(experiment_name, opt.test_ckpt_name, opt.K)
     if not os.path.isdir(test_result_dir):
         os.makedirs(test_result_dir)
+    if not os.path.isdir(test_result_eval_dir):
+        os.makedirs(test_result_eval_dir)
     '''save parser'''
     
     '''Create dataset and dataloader'''
@@ -707,8 +707,9 @@ def test(opt):
         pbar.set_postfix_str(post_fix_str)
         visual_start = time.time()
 
-        final_img,simp_img,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x, x_hat, g_y,None,None,\
-            flows, mask_norm_trans, xfs, gf)
+        full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
+            ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
+                gp=None,gp_hat=None,flows=flows, masks_normed=mask_norm_trans, occlusions=None, ref_features=xfs, g_features=gf)
         visual_end = time.time()
         # print('visual time:%.3f'%(visual_end-visual_start))
         
@@ -720,8 +721,9 @@ def test(opt):
         test_name += str(to[0])
         from PIL import Image
         Image.fromarray(simp_img).save(os.path.join(test_result_dir,"{0}_simp.jpg".format(test_name)))
+        Image.fromarray(out_img).save(os.path.join(test_result_eval_dir,"{0}_vis.jpg".format(test_name)))
         if opt.output_all:
-            Image.fromarray(final_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
+            Image.fromarray(full_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
         save_end = time.time()
         # print('save time:%.3f'%(save_end-save_start))
         

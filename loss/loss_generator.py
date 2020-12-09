@@ -202,7 +202,79 @@ class PerceptualCorrectness(nn.Module):
         output = F.grid_sample(x, grid, mode='bilinear', padding_mode='zeros')
 
         return output
+
+
+class FlowAttnLoss(nn.Module):
+    r"""
+    """
+
+    def __init__(self, layer=['relu1_1','relu2_1','relu3_1','relu4_1']):
+        super(FlowAttnLoss, self).__init__()
+        self.add_module('vgg', VGG19())
+        self.layer = layer  
+        self.eps=1e-8 
+        self.resample = Resample2d(4, 1, sigma=2)
+        self.criterion = nn.L1Loss()
         
+
+    def __call__(self, target, source, flow_list, attention_list, used_layers,mask=None, use_bilinear_sampling=True):
+        used_layers=sorted(used_layers, reverse=True)
+        # self.target=target
+        # self.source=source
+        self.target_vgg, self.source_vgg = self.vgg(target), self.vgg(source)
+        loss = 0
+        for i in range(len(flow_list)):
+            loss += self.calculate_loss(flow_list[i], attention_list[i], self.layer[used_layers[i]], mask, use_bilinear_sampling)
+
+        return loss
+
+    def calculate_loss(self, flow, attention, layer, mask=None, use_bilinear_sampling=True):
+        target_vgg = self.target_vgg[layer]
+        source_vgg = self.source_vgg[layer]
+
+        if use_bilinear_sampling:
+            input_sample = self.bilinear_warp(source_vgg, flow)
+        else:
+            input_sample = self.resample(source_vgg, flow)
+
+        # weight = torch.exp(-1 * attention)
+        weight = attention # 对于采样不正确的点，我们希望 attention weight小，L = a1*10 + a2*100, s.t. a1+a2=1, a1 a2 > 0
+        loss = self.criterion(weight * target_vgg, weight * input_sample)
+        return loss
+        
+
+    def bilinear_warp(self, source, flow):
+        [b, c, h, w] = source.shape
+        x = torch.arange(w).view(1, -1).expand(h, -1).type_as(source).float() / (w-1)
+        y = torch.arange(h).view(-1, 1).expand(-1, w).type_as(source).float() / (h-1)
+        grid = torch.stack([x,y], dim=0)
+        grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
+        grid = 2*grid - 1
+        flow = 2*flow/torch.tensor([w, h]).view(1, 2, 1, 1).expand(b, -1, h, w).type_as(flow)
+        grid = (grid+flow).permute(0, 2, 3, 1)
+        input_sample = F.grid_sample(source, grid, align_corners=True).view(b, c, -1)
+        return input_sample
+
+    def warp_flow(self,x,flow):
+        [b, c, h, w] = x.shape
+        # mesh grid
+        xx = x.new_tensor(range(w)).view(1,-1).repeat(h,1)
+        yy = x.new_tensor(range(h)).view(-1,1).repeat(1,w)
+        xx = xx.view(1,1,h,w).repeat(b,1,1,1)
+        yy = yy.view(1,1,h,w).repeat(b,1,1,1)
+        grid = torch.cat((xx,yy), dim=1).float()
+        # grid: (b, 2, H, W)
+        grid = grid + flow
+
+        # scale to [-1, 1]
+        grid[:,0,:,:] = 2.0*grid[:,0,:,:]/max(w-1,1) - 1.0
+        grid[:,1,:,:] = 2.0*grid[:,1,:,:]/max(h-1,1) - 1.0
+
+        # to (b, h, w, c) for F.grid_sample
+        grid = grid.permute(0,2,3,1)
+        output = F.grid_sample(x, grid, mode='bilinear', padding_mode='zeros')
+
+        return output
 
 class DT(nn.Module):
     def __init__(self):
@@ -229,7 +301,7 @@ class GicLoss(nn.Module):
         self.dT = DT()
 
     # expect input to be BHWC
-    def forward(self, grid):
+    def forward(self, grid, mask=None):
         B,H,W,_ = grid.size()
         Gx = grid[:, :, :, 0]
         Gy = grid[:, :, :, 1]
@@ -246,4 +318,31 @@ class GicLoss(nn.Module):
         dtup = self.dT(Gyup, Gycenter)
         dtdown = self.dT(Gydown, Gycenter)
 
+        # calculate the mask after dt
+        if mask is not None:
+            assert mask.shape[0]==B
+            assert mask.shape[2]==H
+            assert mask.shape[3]==W
+
+            # calculate mask dt
+            mask_center = mask[:,:, 1:H - 1, 1: W - 1]
+            mask_left = mask[:,:, 1:H - 1, 0:W - 2]
+            mask_right = mask[:,:, 1:H - 1, 2:W]
+
+            mask_up = mask[:,:, 0:H - 2, 1:W - 1]
+            mask_down = mask[:,:, 2:H, 1:W - 1]
+
+            dtm_left = self.dT(mask_left, mask_center)
+            dtm_right = self.dT(mask_right, mask_center)
+            dtm_up = self.dT(mask_up, mask_center)
+            dtm_down = self.dT(mask_down, mask_center)
+
+            # we need to calculate inside part of a mask
+            dtm_left_inside = (dtm_left==0) * mask_center
+            dtm_right_inside = (dtm_right==0) * mask_center
+            dtm_up_inside = (dtm_up==0) * mask_center
+            dtm_down_inside = (dtm_down==0) * mask_center
+
+            return torch.sum(torch.abs(dtleft * dtm_left_inside - dtright*dtm_right_inside) + torch.abs(dtup*dtm_up_inside - dtdown*dtm_down_inside)) / (B*H*W)
         return torch.sum(torch.abs(dtleft - dtright) + torch.abs(dtup - dtdown)) / (B*H*W)
+
