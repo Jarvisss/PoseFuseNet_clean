@@ -106,3 +106,4 @@ checkpoints/
 logs/
 test_result/
 visualize_result/
+test_sim_result/

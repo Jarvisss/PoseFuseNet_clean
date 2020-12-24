@@ -134,10 +134,6 @@ class PerceptualCorrectness(nn.Module):
         [bf,cf,hf,wf] = flow.shape
         # maps = F.interpolate(maps, [h,w]).view(b,-1)
         flow = F.interpolate(flow, [h,w])
-
-        # flow[:,0,:,:] = flow[:,0,:,:]  / wf * w
-        # flow[:,1,:,:] = flow[:,1,:,:]  / hf * h
-
         target_all = target_vgg.view(b, c, -1)                      #[b C N2]
         source_all = source_vgg.view(b, c, -1).transpose(1,2)       #[b N2 C]
 
@@ -228,20 +224,63 @@ class FlowAttnLoss(nn.Module):
 
         return loss
 
+    # def calculate_loss(self, flow, attention, layer, mask=None, use_bilinear_sampling=True):
+    #     target_vgg = self.target_vgg[layer]
+    #     source_vgg = self.source_vgg[layer]
+        
+    #     if use_bilinear_sampling:
+    #         input_sample = self.bilinear_warp(source_vgg, flow)
+    #     else:
+    #         input_sample = self.resample(source_vgg, flow)
+        
+    #     # weight = torch.exp(-1 * attention)
+    #     weight = attention # 对于采样不正确的点，我们希望 attention weight小，L = a1*10 + a2*100, s.t. a1+a2=1, a1 a2 > 0
+    #     loss = self.criterion(weight * target_vgg, weight * input_sample)
+    #     return loss
     def calculate_loss(self, flow, attention, layer, mask=None, use_bilinear_sampling=True):
         target_vgg = self.target_vgg[layer]
         source_vgg = self.source_vgg[layer]
-
+        
         if use_bilinear_sampling:
             input_sample = self.bilinear_warp(source_vgg, flow)
         else:
             input_sample = self.resample(source_vgg, flow)
-
-        # weight = torch.exp(-1 * attention)
-        weight = attention # 对于采样不正确的点，我们希望 attention weight小，L = a1*10 + a2*100, s.t. a1+a2=1, a1 a2 > 0
-        loss = self.criterion(weight * target_vgg, weight * input_sample)
-        return loss
         
+        [b, c, h, w] = target_vgg.shape
+        [bf,cf,hf,wf] = flow.shape
+        # maps = F.interpolate(maps, [h,w]).view(b,-1)
+        flow = F.interpolate(flow, [h,w])
+        target_all = target_vgg.view(b, c, -1)                      #[b C N2]
+        source_all = source_vgg.view(b, c, -1).transpose(1,2)       #[b N2 C]
+
+
+        source_norm = source_all/(source_all.norm(dim=2, keepdim=True)+self.eps) #[b C N2] norm 1
+        target_norm = target_all/(target_all.norm(dim=1, keepdim=True)+self.eps)
+        try:
+            correction = torch.bmm(source_norm, target_norm)                       #[b N2 N2]
+        except:
+            print("An exception occurred")
+            print(source_norm.shape)
+            print(target_norm.shape)
+        (correction_max,max_indices) = torch.max(correction, dim=1)
+
+        # interple with bilinear sampling
+        if use_bilinear_sampling:
+            input_sample = self.bilinear_warp(source_vgg, flow).view(b, c, -1)
+        else:
+            input_sample = self.resample(source_vgg, flow).view(b, c, -1)
+
+        correction_sample = F.cosine_similarity(input_sample, target_all)    #[b 1 N2]
+        loss_map = torch.exp(-correction_sample/(correction_max+self.eps))
+        if attention is None:
+            loss = torch.mean(loss_map) - torch.exp(torch.tensor(-1).type_as(loss_map))
+        else:
+            attention=F.interpolate(attention, size=(h,w))
+            attention=attention.view(-1, h*w) #[b 1 N2]
+            loss_map = loss_map - torch.exp(torch.tensor(-1).type_as(loss_map))
+            loss = torch.mean(attention * loss_map)
+        return loss
+
 
     def bilinear_warp(self, source, flow):
         [b, c, h, w] = source.shape

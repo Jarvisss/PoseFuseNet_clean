@@ -118,6 +118,9 @@ def get_parser():
     parser.add_argument('--attn_avg', action='store_true', help='use average instead of learnt attention')
     parser.add_argument('--mask_sigmoid', action='store_true', help='Use Sigmoid() as mask output layer or not')
     parser.add_argument('--mask_norm_type', type=str, default='softmax', help='softmax | divsum')
+    parser.add_argument('--use_tps_sim', action='store_true', help='use precomputed tps sim')
+    parser.add_argument('--tps_sim_beta1', action='store_true', help='use precomputed tps sim')
+    parser.add_argument('--tps_sim_beta2', action='store_true', help='use precomputed tps sim')
 
     '''Loss options'''
     parser.add_argument('--use_adv', action='store_true', help='use adversarial loss in total generation')
@@ -176,25 +179,34 @@ def init_weights(m, init_type='xavier'):
 def make_dataset(opt):
     """Create dataset"""
     path_to_dataset = opt.path_to_dataset
+    train_tuples_name = 'fasion-pairs-train.csv' if opt.K==1 else 'fasion-%d_tuples-train.csv'%(opt.K+1)
+    test_tuples_name = 'fasion-pairs-test.csv' if opt.K==1 else 'fasion-%d_tuples-test.csv'%(opt.K+1)
+    
+    path_to_train_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_sim' if opt.use_tps_sim else None
+    path_to_test_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_sim'  if opt.use_tps_sim else None
     if path_to_dataset == '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion':
         dataset = FashionDataset(
             phase = opt.phase,
-            path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-train.csv'), 
-            path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-test.csv'), 
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
             path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train_256/'), 
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
-            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
+            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'),
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
             opt=opt)
     else: # '/home/ljw/playground/Multi-source-Human-Image-Generation/data/fasion-dataset'
         dataset = FashionDataset(
             phase = opt.phase,
-            path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-train.csv'), 
-            path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-4_tuples-test.csv'), 
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
             path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train_new_split.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test_new_split.csv'), 
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
             opt=opt)
     return dataset
 
@@ -546,6 +558,7 @@ def train(opt, exp_name):
     criterionCorrectness = PerceptualCorrectness().to(device)
     criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
     criterionFlowAttn = FlowAttnLoss().to(device)
+    
 
     print('-------Training Start--------')
     """ Training start """
@@ -814,10 +827,10 @@ def test(opt):
         GD.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
         GP.load_state_dict(checkpoint_G['GP_state_dict'], strict=False)
     epochCurrent = checkpoint_G['epoch']
-    GF.train()
-    GE.train()
-    GD.train()
-    GP.train()
+    GF.eval()
+    GE.eval()
+    GD.eval()
+    GP.eval()
 
     '''Losses'''
     criterionG = LossG(device=device)

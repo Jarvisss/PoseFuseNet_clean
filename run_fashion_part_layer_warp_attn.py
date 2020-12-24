@@ -15,17 +15,18 @@ matplotlib.use('agg')  # for image save not render
 # from model.DirectE import DirectEmbedder
 # from model.DirectG import DirectGenerator
 # from model.Parsing_net import ParsingGenerator
-# from model.flow_generator import FlowGenerator, AppearanceEncoder, AppearanceDecoder
-from model.pyramid_flow_generator_with_occlu_attn import FlowGenerator, AppearanceDecoder, AppearanceEncoder, PoseAwareAppearanceDecoder
+# from model.pyramid_flow_generator import FlowGenerator
+from model.pyramid_part_flow_generator import PartFlowGenerator, PoseAwarePartAppearanceDecoder
+from model.pyramid_flow_generator_with_occlu_attn import FlowGenerator,PoseAttnFCNGenerator,AppearanceDecoder, AppearanceEncoder, PoseAwareAppearanceDecoder
 from model.discriminator import ResDiscriminator
-from model.blocks import warp_flow,_freeze,_unfreeze
+from model.blocks import warp_flow,_freeze,_unfreeze, gen_uniform_grid
 
-from util.vis_util import visualize_feature, visualize_feature_group, visualize_parsing, get_pyramid_visualize_result, tensor2im
+from util.vis_util import visualize_feature, visualize_feature_group, visualize_parsing, get_layer_warp_visualize_result,get_layer_warp_K_visualize_result
 from torch.optim.lr_scheduler import MultiStepLR, ReduceLROnPlateau
 
 from dataset.fashion_dataset import FashionDataset
-from loss.loss_generator import PerceptualCorrectness, LossG, MultiAffineRegularizationLoss, FlowAttnLoss
-from loss.externel_functions import AdversarialLoss
+from loss.loss_generator import PerceptualCorrectness, LossG, MultiAffineRegularizationLoss, FlowAttnLoss, GicLoss
+from loss.externel_functions import AdversarialLoss,VGG19, VGGLoss
 
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
@@ -40,7 +41,6 @@ import json
 
 device = torch.device("cuda:0") 
 cpu = torch.device("cpu")
-
 
 def save_parser(opt,fn):
     with open(fn, 'w') as f:
@@ -84,14 +84,14 @@ def get_parser():
     parser.add_argument('--flow_exp_name',type=str, default='', help='if pretrain flow, specify this to use it in final train')
     parser.add_argument('--which_flow_epoch',type=str, default='epoch_latest', help='specify it to use certain epoch checkpoint')
     parser.add_argument('--anno_size', type=int, nargs=2, help='input annotation size')
-    parser.add_argument('--model_save_freq', type=int, default=2000, help='save model every N iters')
+    parser.add_argument('--model_save_freq', type=int, default=0, help='save model every epoch')
     parser.add_argument('--img_save_freq', type=int, default=200, help='save image every N iters')
 
     '''Dataset options'''
     parser.add_argument('--use_clean_pose', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--use_parsing', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--categories', type=int, default=9)
     parser.add_argument('--use_simmap', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
-    parser.add_argument('--joints_for_cos_sim',type=int, default=-1, help='joints used for cosine sim computation')
 
     '''Model options'''
     parser.add_argument('--n_enc', type=int, default=2, help='encoder(decoder) layers ')
@@ -102,6 +102,7 @@ def get_parser():
 
     parser.add_argument('--use_spectral_G', action='store_true', help='open this if use spectral normalization in generator')
     parser.add_argument('--use_spectral_D', action='store_true', help='open this if use spectral normalization in discriminator')
+    parser.add_argument('--use_multi_layer_flow', action='store_true', help='open this if generator output multilayer flow')
 
 
     '''Test options'''
@@ -116,30 +117,35 @@ def get_parser():
 
     '''Experiment options'''
     parser.add_argument('--use_attn', action='store_true', help='use attention for multi-view parsing generation')
+    parser.add_argument('--attn_avg', action='store_true', help='use average instead of learnt attention')
     parser.add_argument('--mask_sigmoid', action='store_true', help='Use Sigmoid() as mask output layer or not')
     parser.add_argument('--mask_norm_type', type=str, default='softmax', help='softmax | divsum')
-    parser.add_argument('--use_tps_sim', action='store_true', help='use precomputed tps sim')
-    parser.add_argument('--tps_sim_beta1', type=float, default=5.0, help='use precomputed tps sim')
-    parser.add_argument('--tps_sim_beta2', type=float, default=40.0, help='use precomputed tps sim')
 
     '''Loss options'''
     parser.add_argument('--use_adv', action='store_true', help='use adversarial loss in total generation')
     parser.add_argument('--use_bilinear_correctness', action='store_true', help='use bilinear sampling in sample loss')
     parser.add_argument('--G_use_resample', action='store_true', help='use gaussian sampling in the target decoder')
     parser.add_argument('--use_correctness', action='store_true', help='use sample correct loss')
-    parser.add_argument('--use_flow_attn_loss', action='store_true', help='use flow attention loss')
     parser.add_argument('--use_flow_reg', action='store_true', help='use flow regularization')
+    parser.add_argument('--use_flow_attn_loss', action='store_true', help='use flow attention loss')
 
     parser.add_argument('--lambda_style', type=float, default=500.0, help='style loss')
     parser.add_argument('--lambda_content', type=float, default=0.5, help='content loss')
     parser.add_argument('--lambda_rec', type=float, default=5.0, help='L1 loss')
     parser.add_argument('--lambda_adv', type=float, default=2.0, help='GAN loss weight')
     parser.add_argument('--lambda_correctness', type=float, default=5.0, help='sample correctness weight')
-    parser.add_argument('--lambda_flow_reg', type=float, default=0.0025, help='regular sample loss weight')
-    parser.add_argument('--lambda_flow_attn', type=float, default=5.0, help='regular sample loss weight')
-    opt = parser.parse_args()
-    return opt   
+    parser.add_argument('--lambda_flow_attn', type=float, default=1, help='regular sample loss weight')
+    
+    # roi warp weights
+    parser.add_argument('--use_mask_tv',action='store_true', help='use masked total variation flow loss')
+    parser.add_argument('--lambda_flow_reg', type=float, default=200, help='regular sample loss weight')
+    parser.add_argument('--lambda_struct', type=float, default=10, help='regular sample loss weight')
+    parser.add_argument('--lambda_roi_l1', type=float, default=10, help='regular sample loss weight')
+    parser.add_argument('--lambda_roi_perc', type=float, default=1, help='regular sample loss weight')
 
+                
+    opt = parser.parse_args()
+    return opt
 
 def create_writer(path_to_log_dir):
     TIMESTAMP = "/{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
@@ -167,12 +173,12 @@ def make_ckpt_log_vis_dirs(opt, exp_name):
     
     return path_to_ckpt_dir, path_to_log_dir, path_to_visualize_dir
 
-def init_weights(m, init_type='normal'):
+def init_weights(m, init_type='xavier'):
     if type(m) == nn.Conv2d:
         if init_type=='xavier':
             torch.nn.init.xavier_uniform_(m.weight)
         elif init_type=='normal':
-            torch.nn.init.normal_(m.weight,0,0.02)
+            torch.nn.init.normal_(m.weight)
         elif init_type=='kaiming':
             torch.nn.init.kaiming_normal_(m.weight)
 
@@ -181,9 +187,12 @@ def make_dataset(opt):
     path_to_dataset = opt.path_to_dataset
     train_tuples_name = 'fasion-pairs-train.csv' if opt.K==1 else 'fasion-%d_tuples-train.csv'%(opt.K+1)
     test_tuples_name = 'fasion-pairs-test.csv' if opt.K==1 else 'fasion-%d_tuples-test.csv'%(opt.K+1)
-    path_to_train_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_sim' if opt.use_tps_sim else None
-    path_to_test_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_sim'  if opt.use_tps_sim else None
-
+    if opt.use_parsing:
+        path_to_train_parsing = os.path.join(path_to_dataset, 'train_parsing_merge/')
+        path_to_test_parsing = os.path.join(path_to_dataset, 'test_parsing_merge/')
+    else:
+        path_to_train_parsing = None
+        path_to_test_parsing = None
     if path_to_dataset == '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion':
         dataset = FashionDataset(
             phase = opt.phase,
@@ -193,14 +202,14 @@ def make_dataset(opt):
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
-            path_to_train_label_dir=path_to_train_label,
-            path_to_test_label_dir=path_to_test_label,
+            path_to_train_parsings_dir=path_to_train_parsing, 
+            path_to_test_parsings_dir=path_to_test_parsing, 
             opt=opt)
     else: # '/home/ljw/playground/Multi-source-Human-Image-Generation/data/fasion-dataset'
         dataset = FashionDataset(
             phase = opt.phase,
-            path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-%d_tuples-train.csv'%(opt.K+1)), 
-            path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-%d_tuples-test.csv'%(opt.K+1)), 
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
             path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train_new_split.csv'), 
@@ -224,16 +233,28 @@ def save_discriminator(parallel, D, optimizerD, path_to_chkpt_D):
     }, path_to_chkpt_D)    
     pass
 
-def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,path_to_chkpt_G):
+def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,path_to_chkpt_G,GP=None):
     GE_state_dict = GE.state_dict() if not parallel else GE.module.state_dict()
     GF_state_dict = GF.state_dict() if not parallel else GF.module.state_dict()
     GD_state_dict = GD.state_dict() if not parallel else GD.module.state_dict()
+    # GP_state_dict = GP.state_dict() if not parallel else GP.module.state_dict()
     torch.save({
         'epoch': epoch,
         'lossesG': lossesG,
         'GE_state_dict': GE_state_dict,
         'GF_state_dict': GF_state_dict,
         'GD_state_dict': GD_state_dict,
+        # 'GP_state_dict': GP_state_dict,
+        'i_batch': i_batch,
+        'optimizerG': optimizerG.state_dict(),
+    }, path_to_chkpt_G)
+
+def save_flow_generator(parallel, epoch, lossesG, GF, i_batch, optimizerG, path_to_chkpt_G):
+    GF_state_dict = GF.state_dict() if not parallel else GF.module.state_dict()
+    torch.save({
+        'epoch': epoch,
+        'lossesG': lossesG,
+        'GF_state_dict': GF_state_dict,
         'i_batch': i_batch,
         'optimizerG': optimizerG.state_dict(),
     }, path_to_chkpt_G)
@@ -241,12 +262,14 @@ def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,pat
 def init_flowgenerator(opt, path_to_chkpt):
     image_nc = 3
     structure_nc = 21
-    if opt.use_parsing:
-        structure_nc += 20
+    categories = opt.categories
+    flow_layers = [2,3]
+
     if opt.use_simmap:
         image_nc += 13
     
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= [2,3], ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = PartFlowGenerator(image_nc=image_nc, structure_nc=structure_nc,parsing_nc=categories, n_layers=5, flow_layers=flow_layers, 
+    ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G, output_multi_layers=opt.use_multi_layer_flow)
     if opt.parallel:
         GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
     GF = GF.to(device)
@@ -259,23 +282,9 @@ def init_flowgenerator(opt, path_to_chkpt):
         GF.apply(init_weights)
 
         print('Initiating new flow model checkpoint...')
-        if opt.parallel:
-            torch.save({
-                    'epoch': 0,
-                    'lossesG': [],
-                    'GF_state_dict': GF.module.state_dict(),
-                    'i_batch': 0,
-                    'optimizerG': optimizerG.state_dict(),
-                    }, path_to_chkpt)
-        else:
-            torch.save({
-                    'epoch': 0,
-                    'lossesG': [],
-                    'GF_state_dict': GF.state_dict(),
-                    'i_batch': 0,
-                    'optimizerG': optimizerG.state_dict(),
-                    }, path_to_chkpt)
+        save_flow_generator(opt.parallel, 0, [], GF, 0, optimizerG, path_to_chkpt)
         print('...Done')
+    return GF, optimizerG
 
 def init_discriminator(opt, path_to_chkpt):
     D_inc = 3
@@ -300,30 +309,34 @@ def init_generator(opt, path_to_chkpt, path_to_flow_chkpt=None):
     '''
     image_nc = 3
     structure_nc = 21
+    categories = opt.categories
     flow_layers = [2,3]
-    if opt.use_parsing:
-        structure_nc += 20
+
     if opt.use_simmap:
         image_nc += 13
 
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = PartFlowGenerator(image_nc=image_nc, structure_nc=structure_nc, parsing_nc=categories, n_layers=5, flow_layers= flow_layers, 
+        ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G, output_multi_layers=opt.use_multi_layer_flow)
     GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
-    
+    # GP = PoseAttnFCNGenerator(structure_nc=structure_nc,n_layers=5, attn_layers= flow_layers, ngf=32, max_nc=256,norm_type=opt.norm_type, activation=opt.activation,use_spectral_norm=opt.use_spectral_G)
+
     if not opt.use_pose_decoder:
         GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
     else:
-        GD = PoseAwareAppearanceDecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+        GD = PoseAwarePartAppearanceDecoder(structure_nc=21,parsing_nc=opt.categories, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
 
     if opt.parallel:
         GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
         GE = nn.DataParallel(GE)
         GD = nn.DataParallel(GD)
+        # GP = nn.DataParallel(GP)
 
     GF = GF.to(device)
     GE = GE.to(device)
     GD = GD.to(device)
+    # GP = GP.to(device)
 
     optimizerG = optim.Adam(params = list(GF.parameters()) + list(GE.parameters()) + list(GD.parameters()) ,
                             lr=opt.lr,
@@ -336,12 +349,14 @@ def init_generator(opt, path_to_chkpt, path_to_flow_chkpt=None):
         GF.apply(init_weights)
         GE.apply(init_weights)
         GD.apply(init_weights)
+        # GP.apply(init_weights)
 
         print('Initiating new checkpoint...')
         if not opt.flow_onfly:
             if path_to_flow_chkpt is not None:
+                print(path_to_flow_chkpt)
                 checkpoint_flow = torch.load(path_to_flow_chkpt, map_location=cpu)
-                print('load flow from existing checkpoint, epoch: {0},batch: {1}'.format(checkpoint_flow['epoch'],checkpoint_flow['i_batch']))
+                print('load flow from existing checkpoint, epoch: {0}, batch: {1}'.format(checkpoint_flow['epoch'],checkpoint_flow['i_batch']))
                 if opt.parallel:
                     GF.module.load_state_dict(checkpoint_flow['GF_state_dict'], strict=False)
                 else:
@@ -383,14 +398,15 @@ def train_flow_net(opt, exp_name):
     i_batch_current = checkpoint['i_batch']
     i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
     optimizerG.load_state_dict(checkpoint['optimizerG'])
-    
-
+    # GE = VGG19().to(device)
+    # _freeze(GE)
     '''create tensorboard writter'''
     writer = create_writer(path_to_log_dir)
     
     '''Losses'''
-    criterionG = LossG(device=device)
-    criterionCorrectness = PerceptualCorrectness().to(device)
+    criterionL1 = nn.L1Loss().to(device)
+    criterionReg = GicLoss().to(device)
+    criterionVgg = VGGLoss().to(device)
 
     """ Training start """
     for epoch in range(epochCurrent, opt.epochs):
@@ -403,65 +419,71 @@ def train_flow_net(opt, exp_name):
         for i_batch, batch_data in enumerate(pbar, start=0):
             ref_xs = batch_data['ref_xs']
             ref_ys = batch_data['ref_ys']
+            ref_ps = batch_data['ref_ps']
             g_x = batch_data['g_x']
             g_y = batch_data['g_y']
-            assert(len(ref_xs)==len(ref_ys))
+            g_p = batch_data['g_p']
             assert(len(ref_xs)==opt.K)
+            assert(len(ref_ys)==opt.K)
+            assert(len(ref_ps)==opt.K)
+
             for i in range(len(ref_xs)):
                 ref_xs[i] = ref_xs[i].to(device)
                 ref_ys[i] = ref_ys[i].to(device)
+                ref_ps[i] = ref_ps[i].to(device)
 
             g_x = g_x.to(device) # [B, 3, 256, 256]
             g_y = g_y.to(device) # [B, 20, 256, 256]
+            g_p = g_p.to(device) # [B, 20, 256, 256]
             
-            flows, masks, xfs = [], [], []
-            flows_down,masks_down, xfs_warp = [], [], []
+            flows, masks, attns = [], [], []
             for k in range(0, opt.K):
-                flow_k, mask_k = GF(ref_xs[k], ref_ys[k], g_y)
-                xf_k = GE(ref_xs[k])
-                flow_k_down = F.interpolate(flow_k * (xf_k.shape[2]-1) / (flow_k.shape[2]-1), size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
-                mask_k_down = F.interpolate(mask_k, size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
-                xf_k_warp = warp_flow(xf_k, flow_k_down, align_corners=opt.align_corner)
+                flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k],ref_ps[k], g_y, g_p)
+                assert(flow_ks[0].shape[1]==2*opt.categories)
+                assert(flow_ks[1].shape[1]==2*opt.categories)
+                flows += [flow_ks]
+                masks += [mask_ks]
+                attns += [attn_ks]
 
-                flows += [flow_k]
-                masks += [mask_k]
-                xfs += [xf_k]
-                flows_down += [flow_k_down]
-                masks_down += [mask_k_down]
-                xfs_warp += [xf_k_warp]
-            
+            loss_reg = 0
+            loss_roi_perc = 0
+            loss_struct = 0
+            loss_roi_l1 = 0
+            for k in range(0, opt.K):
+                for i in range(2):
+                    H,W = flows[k][i].shape[2], flows[k][i].shape[3]
+                    size = (H,W )
+                    ref_x_down = F.interpolate(ref_xs[k], size, mode='bilinear', align_corners=opt.align_corner)
+                    g_x_down = F.interpolate(g_x, size, mode='bilinear', align_corners= opt.align_corner)
+                    uniform_grid = gen_uniform_grid(flows[k][i])
+                    for c in range(opt.categories):
+                        if torch.sum(ref_ps[k][:,c:c+1,...]) > 0 and torch.sum(g_p[:,c:c+1,...]) > 0: # if source and target both have this category
+                            warp_refx_down = warp_flow(ref_x_down, flows[k][i][:,2*c:2*c+2,...], align_corners=opt.align_corner)
+                            ref_pc_down = F.interpolate(ref_ps[k][:,c:c+1,...], size, mode='bilinear', align_corners=opt.align_corner)
+                            g_pc_down = F.interpolate(g_p[:,c:c+1,...], size, mode='bilinear', align_corners=opt.align_corner)
+                            warp_refpc_down = warp_flow(ref_pc_down, flows[k][i][:,2*c:2*c+2,...], align_corners=opt.align_corner)
+                            
+                            loss_struct += criterionL1(warp_refpc_down, g_pc_down)
+                            content, _ = criterionVgg(warp_refx_down * warp_refpc_down, g_x_down * g_pc_down)
+                            loss_roi_perc += content
+                            loss_roi_l1 += criterionL1(warp_refx_down * warp_refpc_down, g_x_down * g_pc_down)
+                            if opt.use_mask_tv and c in [7,8]:
+                                mask = warp_refpc_down
+                            else:
+                                mask = None
+                            loss_reg += criterionReg((flows[k][i][:,2*c:2*c+2,...]*2/H + uniform_grid).permute(0,2,3,1), mask=mask)
+
+            loss_struct = loss_struct / opt.K * opt.lambda_struct
+            loss_roi_l1 = loss_roi_l1 / opt.K * opt.lambda_roi_l1
+            loss_roi_perc = loss_roi_perc / opt.K * opt.lambda_roi_perc
+            loss_reg = loss_reg / opt.K * opt.lambda_flow_reg
             '''normalize masks to sum to 1'''
-            mask_cat = torch.cat(masks_down, dim=1)
-            if opt.mask_norm_type == 'softmax':
-                mask_normed = F.softmax(mask_cat, dim=1) # pixel wise sum to 1
-            else:
-                eps = 1e-12
-                mask_normed = mask_cat / (torch.sum(mask_cat, dim=1).unsqueeze(1)+eps) # pixel wise sum to 1
 
-            xfs_warp_masked = None
-            xf_merge = None
-            for k in range(0, opt.K):
-                mask_normed_k_down = mask_normed[:,k:k+1,...]
-
-                if xfs_warp_masked is None:
-                    xfs_warp_masked = [xfs_warp[k] * mask_normed_k_down]
-                    xf_merge = xfs_warp[k] * mask_normed_k_down
-                else:
-                    xfs_warp_masked.append(xfs_warp[k] * mask_normed_k_down)
-                    xf_merge += xfs_warp[k] * mask_normed_k_down
-
-            x_hat = GD(xf_merge)
-
-            lossG_content, lossG_style, lossG_L1 = criterionG(g_x, x_hat)
-
-            lossG_content = lossG_content * opt.lambda_content
-            lossG_style = lossG_style * opt.lambda_style
-            lossG_L1 = lossG_L1 * opt.lambda_rec
-
-            writer.add_scalar('{0}/lossG_content'.format(opt.phase), lossG_content.item(), global_step=i_batch_total, walltime=None)
-            writer.add_scalar('{0}/lossG_style'.format(opt.phase), lossG_style.item(), global_step=i_batch_total, walltime=None)
-            writer.add_scalar('{0}/lossG_L1'.format(opt.phase), lossG_L1.item(), global_step=i_batch_total, walltime=None)
-            lossG = lossG_content + lossG_style + lossG_L1
+            writer.add_scalar('{0}/loss_struct'.format(opt.phase), loss_struct.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/loss_roi_l1'.format(opt.phase), loss_roi_l1.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/loss_roi_perc'.format(opt.phase), loss_roi_perc.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/loss_reg'.format(opt.phase), loss_reg.item(), global_step=i_batch_total, walltime=None)
+            lossG = loss_struct + loss_roi_l1 + loss_roi_perc + loss_reg
 
             optimizerG.zero_grad()
             lossG.backward(retain_graph=False)
@@ -470,26 +492,30 @@ def train_flow_net(opt, exp_name):
             epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
             i_batch_total += 1
             
-            post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
+            post_fix_str = 'Epo_loss=%.3f, G=%.3f,L1=%.3f,L_cnt=%.3f,L_reg=%.3f,L_struct=%.3f'%(epoch_loss_G_moving, lossG.item(), loss_roi_l1.item(), loss_roi_perc.item(), loss_reg.item(), loss_struct.item())
 
             pbar.set_postfix_str(post_fix_str)
             if opt.use_scheduler:
                 lr_scheduler.step(epoch_loss_G_moving)
             lossesG.append(lossG.item())
             
-            if i_batch * opt.batch_size % opt.model_save_freq == 0:
-                final_img,_,_ = get_visualize_result(opt, ref_xs, ref_ys,None, g_x, g_y,None,None, xf_merge, x_hat,\
-                    flows, F.interpolate(mask_normed, size=g_x.shape[2:], mode='bilinear',align_corners=opt.align_corner), xfs, xfs_warp, xfs_warp_masked)
-                
+
+            if i_batch % opt.img_save_freq == 0:    
+                final_img,_,_ = get_layer_warp_visualize_result(opt, ref_xs, ref_ys, ref_ps, g_x, g_y, g_p, flows)
                 plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
-     
+            
+            if i_batch % opt.model_save_freq == 0:
+                path_to_save_G = path_to_ckpt_dir + 'epoch_{}_batch_{}_G.tar'.format(epoch, i_batch)
+                save_flow_generator(opt.parallel, epoch, lossesG, GF, i_batch, optimizerG, path_to_save_G)
+        save_flow_generator(opt.parallel, epoch+1, lossesG, GF, i_batch, optimizerG, path_to_chkpt)
+
 def train(opt, exp_name):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
     
     '''Set logging,checkpoint,vis dir'''
     path_to_ckpt_dir, path_to_log_dir, path_to_visualize_dir = make_ckpt_log_vis_dirs(opt, exp_name)
-    path_to_chkpt_G = path_to_ckpt_dir + 'model_weights_G.tar' 
-    path_to_chkpt_D = path_to_ckpt_dir + 'model_weights_D.tar' 
+    path_to_chkpt_G = path_to_ckpt_dir + 'epoch_3_G.tar' 
+    path_to_chkpt_D = path_to_ckpt_dir + 'epoch_3_D.tar' 
 
     path_to_chkpt_flow = None
     if not opt.flow_onfly:
@@ -543,9 +569,14 @@ def train(opt, exp_name):
     '''Losses'''
     criterionG = LossG(device=device)
     criterion_GAN = AdversarialLoss(type='lsgan').to(device)
-    criterionCorrectness = PerceptualCorrectness().to(device)
-    criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
-    criterionFlowAttn = FlowAttnLoss().to(device)
+
+
+    criterionL1 = nn.L1Loss().to(device)
+    criterionReg = GicLoss().to(device)
+    criterionVgg = VGGLoss().to(device)
+    # criterionCorrectness = PerceptualCorrectness().to(device)
+    # criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+    # criterionFlowAttn = FlowAttnLoss().to(device)
 
     print('-------Training Start--------')
     """ Training start """
@@ -554,82 +585,134 @@ def train(opt, exp_name):
             i_batch_current = 0
         epoch_loss_G = 0
         pbar = tqdm(dataloader, leave=True, initial=0)
-        pbar.set_description('[{0:>4}/{1:>4}], G_lr-{2},D_lr-{3}'.format(epoch,opt.epochs,optimizerG.param_groups[0]['lr'],optimizerD.param_groups[0]['lr']))
+        pbar.set_description('[{0:>4}/{1:>4}]'.format(epoch,opt.epochs))
         
         for i_batch, batch_data in enumerate(pbar, start=0):
             ref_xs = batch_data['ref_xs']
             ref_ys = batch_data['ref_ys']
+            ref_ps = batch_data['ref_ps']
             g_x = batch_data['g_x']
             g_y = batch_data['g_y']
-            if opt.use_flow_attn_loss:
-                sims = batch_data['sim']
-                assert(len(sims)==opt.K)
-                for i in range(opt.K):
-                    sims[i] = sims[i].to(device)
-                    
-            assert(len(ref_xs)==len(ref_ys))
+            g_p = batch_data['g_p']
             assert(len(ref_xs)==opt.K)
+            assert(len(ref_ys)==opt.K)
+            assert(len(ref_ps)==opt.K)
+
             for i in range(len(ref_xs)):
                 ref_xs[i] = ref_xs[i].to(device)
                 ref_ys[i] = ref_ys[i].to(device)
-                
+                ref_ps[i] = ref_ps[i].to(device)
 
             g_x = g_x.to(device) # [B, 3, 256, 256]
             g_y = g_y.to(device) # [B, 20, 256, 256]
+            g_p = g_p.to(device) # [B, 20, 256, 256]
             
-            flows, masks, attns,  xfs = [], [], [], []
-            flows_down,masks_down, xfs_warp = [], [], []
-
             # flows: K *[tensor[2,32,32] tensor[2,64,64]]
             # masks: K *[tensor[1,32,32] tensor[1,64,64]]
             # xfs: K *[tensor[256,32,32] tensor[128,64,64]]
             with torch.no_grad():
                 gf = GE(g_x)[0:2]
-            for k in range(0, opt.K):
-                # get 2 flows, masks and attns at two resolution 32, 64
 
-                flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k], g_y)
-                
-                # get 2 source features at resolution 32, 64
+            flows, masks, attns = [], [], []
+            xfs = []
+            for k in range(0, opt.K):
+                flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k],ref_ps[k], g_y, g_p)
                 xf_ks = GE(ref_xs[k])[0:2]
+                assert(flow_ks[0].shape[1]==2*opt.categories)
+                assert(flow_ks[1].shape[1]==2*opt.categories)
+                assert(mask_ks[1].shape[1]==opt.categories)
+                assert(attn_ks[1].shape[1]==opt.categories)
                 flows += [flow_ks]
                 masks += [mask_ks]
                 attns += [attn_ks]
-                xfs += [xf_ks]
+                xfs+=[xf_ks]
+
+
+            # 计算flow loss部分
+            loss_reg = 0
+            loss_roi_perc = 0
+            loss_struct = 0
+            loss_roi_l1 = 0
+            for k in range(0, opt.K):
+                for i in range(2):
+                    H,W = flows[k][i].shape[2], flows[k][i].shape[3]
+                    size = (H,W )
+                    ref_x_down = F.interpolate(ref_xs[k], size, mode='bilinear', align_corners=opt.align_corner)
+                    g_x_down = F.interpolate(g_x, size, mode='bilinear', align_corners= opt.align_corner)
+                    uniform_grid = gen_uniform_grid(flows[k][i])
+                    for c in range(opt.categories):
+                        if torch.sum(ref_ps[k][:,c:c+1,...]) > 0 and torch.sum(g_p[:,c:c+1,...]) > 0: # if source and target both have this category
+                            warp_refx_down = warp_flow(ref_x_down, flows[k][i][:,2*c:2*c+2,...], align_corners=opt.align_corner)
+                            ref_pc_down = F.interpolate(ref_ps[k][:,c:c+1,...], size, mode='bilinear', align_corners=opt.align_corner)
+                            g_pc_down = F.interpolate(g_p[:,c:c+1,...], size, mode='bilinear', align_corners=opt.align_corner)
+                            warp_refpc_down = warp_flow(ref_pc_down, flows[k][i][:,2*c:2*c+2,...], align_corners=opt.align_corner)
+                            
+                            loss_struct += criterionL1(warp_refpc_down, g_pc_down)
+                            content, _ = criterionVgg(warp_refx_down * warp_refpc_down, g_x_down * g_pc_down)
+                            loss_roi_perc += content
+                            loss_roi_l1 += criterionL1(warp_refx_down * warp_refpc_down, g_x_down * g_pc_down)
+                            if opt.use_mask_tv and c in [7,8]:
+                                mask = warp_refpc_down
+                            else:
+                                mask = None
+                            loss_reg += criterionReg((flows[k][i][:,2*c:2*c+2,...]*2/H + uniform_grid).permute(0,2,3,1), mask=mask)
+
+            loss_struct = loss_struct / opt.K * opt.lambda_struct / 20
+            loss_roi_l1 = loss_roi_l1 / opt.K * opt.lambda_roi_l1 / 20
+            loss_roi_perc = loss_roi_perc / opt.K * opt.lambda_roi_perc / 20
+            loss_reg = loss_reg / opt.K * opt.lambda_flow_reg / 20
+            
+            writer.add_scalar('{0}/loss_struct'.format(opt.phase), loss_struct.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/loss_roi_l1'.format(opt.phase), loss_roi_l1.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/loss_roi_perc'.format(opt.phase), loss_roi_perc.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/loss_reg'.format(opt.phase), loss_reg.item(), global_step=i_batch_total, walltime=None)
+            
+            lossFlow = loss_struct + loss_roi_l1 + loss_roi_perc + loss_reg
+            # 如果是平均，则每个attn的值都为1，然后做softmax变为1/K
+            if opt.attn_avg:
+                for k in range(0, opt.K):
+                    for i in range(0, len(attns[k])):
+                        attns[k][i] = torch.ones_like(attns[k][i])
             
             # 使每个位置，K个attention的和为1
-            # mask_norm: [tensor[K,32,32] tensor[K,64,64]]
-            
+            # attns: [  [[C,32,32] [C,64,64]] * K ]
+            # attn_norm: [tensor[K,32,32] * C , 
+            #               tensor[K,64,64] * C]
             attn_norm = []
             for i in range(len(attns[0])):
-                temp = []
-                for k in range(opt.K):
-                    temp += [ attns[k][i] ]
-                attn_norm += [F.softmax(torch.cat(temp,dim=1), dim=1)]         
-            
-            # mask_norm_trans -> K *[tensor[1,32,32] tensor[1,64,64]]
+
+                for c in range(opt.categories):
+                    temp = []
+                    for k in range(opt.K):
+                        temp += [ attns[k][i][:,c:c+1,...] ]
+                    # temp: 第c个通道，i个layer下的 'K' 个 view连接
+                    # softmax之后，形状是 [K, 32, 32]        
+                    attn_norm += [F.softmax(torch.cat(temp,dim=1), dim=1)]  
+                    # 最终attn_norm为一个列表，其中每一项为第c个通道的softmax。共C*layer项
+
+            # [tensor[K,32,32] * C , 
+            #   tensor[K,64,64] * C] 
+            #  ->  [  [[C,32,32] [C,64,64]] * K ]
+            # 这一步是让attn_norm回到原来的形状。
+            # 从C*layer的列表回到K*layer的列表 
             attn_norm_trans = []
             for k in range(0, opt.K):
-                temp = []
-                for i in range(0, len(attn_norm)):
-                    temp += [attn_norm[i][:,k:k+1,...]] # += [1,32,32]
+                temp = [] # 我们希望temp中是layer个项，每个项为[C,32,32]或者[C,64,64]
+                for i in range(0, len(attn_norm)//opt.categories): # layers
+                    all_cate_in_one = []
+
+                    # 合并第k个view的c个通道, all_cate_in_one是一个列表，每一项为[1,32,32]
+                    for c in range(0, opt.categories):
+                        all_cate_in_one += [attn_norm[i*opt.categories+c][:,k:k+1,...]]
+
+                    # torch.cat 之后为C通道。
+                    temp += [torch.cat(all_cate_in_one, dim=1)] # += [C,32,32], [C,64,64]
+
+                # attn_norm_trans 为 列表，其中每一项为[[C,32,32],[C,64,64]],共K项
                 attn_norm_trans += [temp]
 
-            ### GD input is:
-            # flows: K * [B,2,32,32][B,2,64,64]
-            # masks: K * [B,1,32,32][B,1,64,64]
-            # source_features: K * [B,256,32,32][B,128,64,64]
-            # print('xf len:',len(xfs))
-            # print('xf shape 1:',xfs[0][0].shape)
-            # print('xf shape 2:',xfs[0][1].shape)
-            # print('flow len:',len(flows))
-            # print('flow shape 1:',flows[0][0].shape)
-            # print('flow shape 2:',flows[0][1].shape)
-            # print('mask len:',len(mask_norm_trans))
-            # print('mask shape 1:',mask_norm_trans[0][0].shape)
-            # print('mask shape 2:',mask_norm_trans[0][1].shape)
             if opt.use_pose_decoder:
-                x_hat = GD(g_y, xfs, flows, masks, attn_norm_trans)
+                x_hat = GD(g_y,g_p,ref_ps, xfs, flows, masks, attn_norm_trans)
             else:
                 x_hat = GD(xfs, flows, masks, attn_norm_trans)
 
@@ -661,7 +744,7 @@ def train(opt, exp_name):
             writer.add_scalar('{0}/lossG_content'.format(opt.phase), lossG_content.item(), global_step=i_batch_total, walltime=None)
             writer.add_scalar('{0}/lossG_style'.format(opt.phase), lossG_style.item(), global_step=i_batch_total, walltime=None)
             writer.add_scalar('{0}/lossG_L1'.format(opt.phase), lossG_L1.item(), global_step=i_batch_total, walltime=None)
-            lossG = lossG_content + lossG_style + lossG_L1
+            lossG = lossG_content + lossG_style + lossG_L1 + lossFlow
             if opt.use_adv:
                 _freeze(D)
                 D_fake = D(x_hat)
@@ -669,45 +752,33 @@ def train(opt, exp_name):
                 writer.add_scalar('{0}/lossG_adv'.format(opt.phase), lossG_adv.item(), global_step=i_batch_total, walltime=None)
                 lossG = lossG + lossG_adv
             
-            if opt.use_correctness:
-                loss_correct=0
-                for k in range(opt.K):
-                    loss_correct += criterionCorrectness(g_x, ref_xs[k], flows[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness)
-                    # loss_correct += criterionL1(xfs_warp[k], g_xf)
-                loss_correct = loss_correct/opt.K * opt.lambda_correctness
-                writer.add_scalar('{0}/lossG_correct'.format(opt.phase), loss_correct.item(), global_step=i_batch_total, walltime=None)
-                lossG = lossG + loss_correct
+            # if opt.use_correctness:
+            #     loss_correct=0
+            #     for k in range(opt.K):
+            #         loss_correct += criterionCorrectness(g_x, ref_xs[k], flows[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness)
+            #         # loss_correct += criterionL1(xfs_warp[k], g_xf)
+            #     loss_correct = loss_correct/opt.K * opt.lambda_correctness
+            #     writer.add_scalar('{0}/lossG_correct'.format(opt.phase), loss_correct.item(), global_step=i_batch_total, walltime=None)
+            #     lossG = lossG + loss_correct
 
-            if opt.use_flow_attn_loss:
-                loss_flow_attn = 0 #  sum_i(w_i(P_G-P_i)), wi = exp(-attn)
-                sim = []
+            # if opt.use_flow_reg:
+            #     loss_regular=0
+            #     for k in range(opt.K):
+            #         loss_regular += criterionReg(flows[k])
                 
-                for k in range(0, opt.K):
-                    tt = []
-                    for i in range(0, len(attns[k])):
-                        b,c,h,w = flows[k][i].shape
-                        down_sim = F.interpolate(sims[k], size=(h,w), mode='bilinear',align_corners=opt.align_corner)
-                        # temp = torch.ones_like(attns[k][i]) * down_sim
-                        tt+=[down_sim]
-                    sim += [tt]
-                for k in range(0, opt.K):
-                    loss_flow_attn += criterionFlowAttn(g_x, ref_xs[k], flows[k], sim[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness) #  
-                loss_flow_attn = loss_flow_attn / opt.K * opt.lambda_flow_attn
-
-                # lossG += loss_flow_attn
-                writer.add_scalar('{0}/loss_flow_attn'.format(opt.phase), loss_flow_attn.item(), global_step=i_batch_total, walltime=None)
-
-
-            if opt.use_flow_reg:
-                loss_regular=0
-                for k in range(opt.K):
-                    loss_regular += criterionReg(flows[k])
-                
-                loss_regular = loss_regular / opt.K * opt.lambda_flow_reg
+            #     loss_regular = loss_regular / opt.K * opt.lambda_flow_reg
             
-                lossG += loss_regular
-                writer.add_scalar('{0}/loss_regular'.format(opt.phase), loss_regular.item(), global_step=i_batch_total, walltime=None)
-
+            #     lossG += loss_regular
+            #     writer.add_scalar('{0}/loss_regular'.format(opt.phase), loss_regular.item(), global_step=i_batch_total, walltime=None)
+            
+            # if opt.use_flow_attn_loss:
+            #     loss_flow_attn = 0 #  sum_i(w_i(P_G-P_i)), wi = exp(-attn)
+            #     for k in range(0, opt.K):
+                    
+            #         loss_flow_attn += criterionFlowAttn(g_x, ref_xs[k], flows[k], attn_norm_trans[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness) #  
+            #     loss_flow_attn = loss_flow_attn / opt.K * opt.lambda_flow_attn
+            #     lossG += loss_flow_attn
+            #     writer.add_scalar('{0}/loss_flow_attn'.format(opt.phase), loss_flow_attn.item(), global_step=i_batch_total, walltime=None)
 
             lossG.backward(retain_graph=False)
             optimizerG.step()
@@ -718,12 +789,13 @@ def train(opt, exp_name):
             post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
             if opt.use_adv:
                 post_fix_str += ', G_adv=%.3f, D_loss=%.3f'%(lossG_adv.item(), lossD.item())
-            if opt.use_correctness:
-                post_fix_str += ', G_cor=%.3f'%(loss_correct.item())
-            if opt.use_flow_reg:
-                post_fix_str += ', G_reg=%.3f'%(loss_regular.item())
-            if opt.use_flow_attn_loss:
-                post_fix_str += ', G_flo=%.3f'%(loss_flow_attn.item())
+            # if opt.use_correctness:
+            #     post_fix_str += ', G_cor=%.3f'%(loss_correct.item())
+            # if opt.use_flow_reg:
+            #     post_fix_str += ', G_reg=%.3f'%(loss_regular.item())
+            # if opt.use_flow_attn_loss:
+            #     post_fix_str += ', G_flo=%.3f'%(loss_flow_attn.item())
+            post_fix_str += ', flow_l1=%.3f, flow_struct=%.3f, flow_reg=%.3f, flow_prec=%.3f'%(loss_struct,loss_roi_l1,loss_roi_perc,loss_reg)
             
             pbar.set_postfix_str(post_fix_str)
             if opt.use_scheduler:
@@ -731,49 +803,174 @@ def train(opt, exp_name):
             lossesG.append(lossG.item())
             
             if i_batch % opt.img_save_freq == 0:
-                final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x, x_hat, g_y,None,None,\
-                    flows, attn_norm_trans,masks, xfs, gf)
-                if opt.use_flow_attn_loss:
-                    if not opt.use_tps_sim:
-                        sim0=tensor2im(sim[0][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim1=tensor2im(sim[1][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        final_img[256*2:256*3, 256*4:256*5] = sim0
-                        final_img[256*2:256*3, 256*5:256*6] = sim1
-                    else:
-                        sim00=tensor2im(sim[0][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim10=tensor2im(sim[1][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim01=tensor2im(sim[0][1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim11=tensor2im(sim[1][1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        final_img[256*2:256*3, 256*4:256*5] = sim00
-                        final_img[256*2:256*3, 256*5:256*6] = sim10
-                        final_img[256*3:256*4, 256*4:256*5] = sim01
-                        final_img[256*3:256*4, 256*5:256*6] = sim11
-                    
-                plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
+                full_img,simp_img, out_img = get_layer_warp_K_visualize_result(opt, \
+                    ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=ref_ps, gx=g_x, x_hat=x_hat, gy=g_y,\
+                        gp=g_p,flows=flows, masks=masks, attns=attn_norm_trans, ref_features=xfs, g_features=gf)
+                
+                plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), full_img)
 
-            if i_batch % opt.model_save_freq == 0:
+
+            if opt.model_save_freq != 0 and i_batch % opt.model_save_freq == 0:
                 path_to_save_G = path_to_ckpt_dir + 'epoch_{}_batch_{}_G.tar'.format(epoch, i_batch)
                 path_to_save_D = path_to_ckpt_dir + 'epoch_{}_batch_{}_D.tar'.format(epoch, i_batch)
                 save_generator(opt.parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG, path_to_save_G)
                 save_discriminator(opt.parallel, D, optimizerD, path_to_save_D) 
         
-        save_generator(opt.parallel, epoch+1, lossesG, GE, GF, GD, i_batch, optimizerG, path_to_chkpt_G)
-        save_discriminator(opt.parallel, D, optimizerD, path_to_chkpt_D)
+        save_generator(opt.parallel, epoch+1, lossesG, GE, GF, GD, i_batch, optimizerG, path_to_ckpt_dir + 'epoch_{}_G.tar'.format(epoch))
+        save_discriminator(opt.parallel, D, optimizerD, path_to_ckpt_dir + 'epoch_{}_D.tar'.format(epoch))
         '''save image result'''
-        final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x,x_hat, g_y,None,None, \
-                    flows, attn_norm_trans,masks, xfs, gf)
+        full_img,simp_img, out_img = get_layer_warp_K_visualize_result(opt, \
+            ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=ref_ps, gx=g_x, x_hat=x_hat, gy=g_y,\
+                gp=g_p,flows=flows, masks=masks, attns=attn_norm_trans, ref_features=xfs, g_features=gf)
 
-        plt.imsave(os.path.join(path_to_visualize_dir,"epoch_latest.png"), final_img)
+        plt.imsave(os.path.join(path_to_visualize_dir,"epoch_latest.png"), full_img)
         
             
     writer.close()
 
+def test_flow_net(opt):
+    import time
+    print('-----------TESTING-----------')
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
+    experiment_name = opt.test_id
 
+    '''Set logging,checkpoint,vis dir'''
+    path_to_ckpt_dir = opt.root_dir+ 'checkpoints/{0}/'.format(experiment_name)
+    
+    path_to_chkpt_G = path_to_ckpt_dir + '{0}.tar'.format(opt.test_ckpt_name) 
+    test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    test_result_eval_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot_eval/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    if not os.path.isdir(test_result_dir):
+        os.makedirs(test_result_dir)
+    if not os.path.isdir(test_result_eval_dir):
+        os.makedirs(test_result_eval_dir)
+
+    '''Create dataset and dataloader'''
+    dataset = make_dataset(opt)
+    dataloader = make_dataloader(opt, dataset)
+
+    '''Create Model'''
+    image_nc = 3
+    structure_nc = 21
+    categories = opt.categories
+    flow_layers = [2,3]
+    if opt.use_simmap:
+        image_nc += 13
+    
+    GF = PartFlowGenerator(image_nc=image_nc, structure_nc=structure_nc,parsing_nc=categories,
+        n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256,
+        norm_type=opt.norm_type, activation=opt.activation,
+        use_spectral_norm=opt.use_spectral_G, output_multi_layers=opt.use_multi_layer_flow)
+    
+    if opt.parallel:
+        GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
+
+    
+    checkpoint_G = torch.load(path_to_chkpt_G, map_location=cpu)
+    if opt.parallel:
+        GF.module.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
+    else:
+        GF.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
+    epochCurrent = checkpoint_G['epoch']
+
+    GF = GF.to(device)
+    GF = GF.eval()
+
+    '''Losses'''
+    criterionG = LossG(device=device)
+    criterionCorrectness = PerceptualCorrectness().to(device)
+    criterionL1 = nn.L1Loss().to(device)
+    criterionReg = GicLoss().to(device)
+    criterionVgg = VGGLoss().to(device)
+
+    epoch_loss_G = 0
+    pbar = tqdm(dataloader, leave=True, initial=0)
+    
+    for i_batch, batch_data in enumerate(pbar, start=0):
+        froms = batch_data['froms']
+        to = batch_data['to']
+        ref_xs = batch_data['ref_xs']
+        ref_ys = batch_data['ref_ys']
+        ref_ps = batch_data['ref_ps']
+        g_x = batch_data['g_x']
+        g_y = batch_data['g_y']
+        g_p = batch_data['g_p']
+        assert(len(ref_xs)==opt.K)
+        assert(len(ref_ys)==opt.K)
+        assert(len(ref_ps)==opt.K)
+
+        for i in range(len(ref_xs)):
+            ref_xs[i] = ref_xs[i].to(device)
+            ref_ys[i] = ref_ys[i].to(device)
+            ref_ps[i] = ref_ps[i].to(device)
+
+        g_x = g_x.to(device) # [B, 3, 256, 256]
+        g_y = g_y.to(device) # [B, 20, 256, 256]
+        g_p = g_p.to(device) # [B, 20, 256, 256]
+        
+        flows, masks, attns = [], [], []
+        for k in range(0, opt.K):
+            flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k],ref_ps[k], g_y, g_p)
+            assert(flow_ks[0].shape[1]==2*opt.categories)
+            assert(flow_ks[1].shape[1]==2*opt.categories)
+            flows += [flow_ks]
+            masks += [mask_ks]
+            attns += [attn_ks]
+
+        loss_reg = 0
+        loss_roi_perc = 0
+        loss_struct = 0
+        loss_roi_l1 = 0
+        for k in range(0, opt.K):
+            for i in range(2):
+                H,W = flows[k][i].shape[2], flows[k][i].shape[3]
+                size = (H,W )
+                ref_x_down = F.interpolate(ref_xs[k], size, mode='bilinear', align_corners=opt.align_corner)
+                g_x_down = F.interpolate(g_x, size, mode='bilinear', align_corners= opt.align_corner)
+                uniform_grid = gen_uniform_grid(flows[k][i])
+                for c in range(opt.categories):
+                    if torch.sum(ref_ps[k][:,c:c+1,...]) > 0 and torch.sum(g_p[:,c:c+1,...]) > 0: # if source and target both have this category
+                        warp_refx_down = warp_flow(ref_x_down, flows[k][i][:,2*c:2*c+2,...], align_corners=opt.align_corner)
+                        ref_pc_down = F.interpolate(ref_ps[k][:,c:c+1,...], size, mode='bilinear', align_corners=opt.align_corner)
+                        g_pc_down = F.interpolate(g_p[:,c:c+1,...], size, mode='bilinear', align_corners=opt.align_corner)
+                        warp_refpc_down = warp_flow(ref_pc_down, flows[k][i][:,2*c:2*c+2,...], align_corners=opt.align_corner)
+                        
+                        loss_struct += criterionL1(warp_refpc_down, g_pc_down)
+                        content, _ = criterionVgg(warp_refx_down * warp_refpc_down, g_x_down * g_pc_down)
+                        loss_roi_perc += content
+                        loss_roi_l1 += criterionL1(warp_refx_down * warp_refpc_down, g_x_down * g_pc_down)
+                        if opt.use_mask_tv and c in [7,8]:
+                            mask = warp_refpc_down
+                        else:
+                            mask = None
+                        loss_reg += criterionReg((flows[k][i][:,2*c:2*c+2,...]*2/H + uniform_grid).permute(0,2,3,1), mask=mask)
+
+        loss_struct = loss_struct / opt.K * opt.lambda_struct
+        loss_roi_l1 = loss_roi_l1 / opt.K * opt.lambda_roi_l1
+        loss_roi_perc = loss_roi_perc / opt.K * opt.lambda_roi_perc
+        loss_reg = loss_reg / opt.K * opt.lambda_flow_reg
+        '''normalize masks to sum to 1'''
+
+        lossG = loss_struct + loss_roi_l1 + loss_roi_perc + loss_reg
+
+        epoch_loss_G += lossG.item()
+        epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
+        
+        post_fix_str = 'Epo_loss=%.3f, G=%.3f,L1=%.3f,L_cnt=%.3f,L_reg=%.3f,L_struct=%.3f'%(epoch_loss_G_moving, lossG.item(), loss_roi_l1.item(), loss_roi_perc.item(), loss_reg.item(), loss_struct.item())
+
+        pbar.set_postfix_str(post_fix_str)
+        test_name = ''
+        # print(froms)
+        for k in range(opt.K):
+            test_name += str(froms[k][0])+'+'
+        test_name += str(to[0])
+        from PIL import Image
+        final_img,_,_ = get_layer_warp_visualize_result(opt, ref_xs, ref_ys, ref_ps, g_x, g_y, g_p, flows)
+        Image.fromarray(final_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
+        
 def test(opt):
-    from util.io import load_image, load_skeleton, load_parsing, transform_image
     import time
     
-
     print('-----------TESTING-----------')
     os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
     experiment_name = opt.test_id
@@ -797,21 +994,22 @@ def test(opt):
     '''Create Model'''
     image_nc = 3
     structure_nc = 21
+    categories = opt.categories
     flow_layers = [2,3]
-    if opt.use_parsing:
-        structure_nc += 20
     if opt.use_simmap:
         image_nc += 13
 
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = PartFlowGenerator(image_nc=image_nc, structure_nc=structure_nc, parsing_nc=categories, n_layers=5, flow_layers= flow_layers, 
+        ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G, output_multi_layers=opt.use_multi_layer_flow)
     GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    
     if not opt.use_pose_decoder:
         GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
     else:
-        GD = PoseAwareAppearanceDecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+        GD = PoseAwarePartAppearanceDecoder(structure_nc=21,parsing_nc=opt.categories, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
-    
+
     if opt.parallel:
         GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
         GE = nn.DataParallel(GE)
@@ -839,8 +1037,10 @@ def test(opt):
     '''Losses'''
     criterionG = LossG(device=device)
     criterion_GAN = AdversarialLoss(type='lsgan').to(device)
-    criterionCorrectness = PerceptualCorrectness().to(device)
-    criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+
+    criterionL1 = nn.L1Loss().to(device)
+    criterionReg = GicLoss().to(device)
+    criterionVgg = VGGLoss().to(device)
 
     """ Test start """
     epoch_loss_G = 0
@@ -852,19 +1052,24 @@ def test(opt):
         to = batch_data['to']
         ref_xs = batch_data['ref_xs']
         ref_ys = batch_data['ref_ys']
+        ref_ps = batch_data['ref_ps']
         g_x = batch_data['g_x']
         g_y = batch_data['g_y']
-        assert(len(ref_xs)==len(ref_ys))
+        g_p = batch_data['g_p']
         assert(len(ref_xs)==opt.K)
+        assert(len(ref_ys)==opt.K)
+        assert(len(ref_ps)==opt.K)
+
         for i in range(len(ref_xs)):
             ref_xs[i] = ref_xs[i].to(device)
             ref_ys[i] = ref_ys[i].to(device)
+            ref_ps[i] = ref_ps[i].to(device)
 
         g_x = g_x.to(device) # [B, 3, 256, 256]
         g_y = g_y.to(device) # [B, 20, 256, 256]
-        
-        flows, masks, attns,  xfs = [], [], [], []
-        flows_down,masks_down, xfs_warp = [], [], []
+        g_p = g_p.to(device) # [B, 20, 256, 256]
+    
+        flows, masks, attns, xfs = [], [], [], []
 
         # flows: K *[tensor[2,32,32] tensor[2,64,64]]
         # masks: K *[tensor[1,32,32] tensor[1,64,64]]
@@ -872,35 +1077,53 @@ def test(opt):
         with torch.no_grad():
             gf = GE(g_x)[0:2]
         
-        
         for k in range(0, opt.K):
-            # get 2 flows and masks at two resolution 32, 64
-            flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k], g_y)
-
-            
-            # get 2 source features at resolution 32, 64
+            flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k],ref_ps[k], g_y, g_p)
             xf_ks = GE(ref_xs[k])[0:2]
-
+            assert(flow_ks[0].shape[1]==2*opt.categories)
+            assert(flow_ks[1].shape[1]==2*opt.categories)
+            assert(mask_ks[1].shape[1]==opt.categories)
+            assert(attn_ks[1].shape[1]==opt.categories)
             flows += [flow_ks]
             masks += [mask_ks]
             attns += [attn_ks]
-            xfs += [xf_ks]
+            xfs+=[xf_ks]
         
-        # 使每个位置，K个attention的和为1
-        # mask_norm: [tensor[K,32,32] tensor[K,64,64]]
+        if opt.attn_avg:
+            for k in range(0, opt.K):
+                for i in range(0, len(attns[k])):
+                    attns[k][i] = torch.ones_like(attns[k][i])
         attn_norm = []
         for i in range(len(attns[0])):
-            temp = []
-            for k in range(opt.K):
-                temp += [ attns[k][i] ]
-            attn_norm += [F.softmax(torch.cat(temp,dim=1), dim=1)]         
-        
-        # mask_norm_trans -> K *[tensor[1,32,32] tensor[1,64,64]]
+
+            for c in range(opt.categories):
+                temp = []
+                for k in range(opt.K):
+                    temp += [ attns[k][i][:,c:c+1,...] ]
+                # temp: 第c个通道，i个layer下的 'K' 个 view连接
+                # softmax之后，形状是 [K, 32, 32]        
+                attn_norm += [F.softmax(torch.cat(temp,dim=1), dim=1)]  
+                # 最终attn_norm为一个列表，其中每一项为第c个通道的softmax。共C*layer项
+
+        # [tensor[K,32,32] * C , 
+        #   tensor[K,64,64] * C] 
+        #  ->  [  [[C,32,32] [C,64,64]] * K ]
+        # 这一步是让attn_norm回到原来的形状。
+        # 从C*layer的列表回到K*layer的列表 
         attn_norm_trans = []
         for k in range(0, opt.K):
-            temp = []
-            for i in range(0, len(attn_norm)):
-                temp += [attn_norm[i][:,k:k+1,...]] # += [1,32,32]
+            temp = [] # 我们希望temp中是layer个项，每个项为[C,32,32]或者[C,64,64]
+            for i in range(0, len(attn_norm)//opt.categories): # layers
+                all_cate_in_one = []
+
+                # 合并第k个view的c个通道, all_cate_in_one是一个列表，每一项为[1,32,32]
+                for c in range(0, opt.categories):
+                    all_cate_in_one += [attn_norm[i*opt.categories+c][:,k:k+1,...]]
+
+                # torch.cat 之后为C通道。
+                temp += [torch.cat(all_cate_in_one, dim=1)] # += [C,32,32], [C,64,64]
+
+            # attn_norm_trans 为 列表，其中每一项为[[C,32,32],[C,64,64]],共K项
             attn_norm_trans += [temp]
 
         ### GD input is:
@@ -917,7 +1140,7 @@ def test(opt):
         # print('mask shape 1:',mask_norm_trans[0][0].shape)
         # print('mask shape 2:',mask_norm_trans[0][1].shape)
         if opt.use_pose_decoder:
-            x_hat = GD(g_y, xfs, flows, masks, attn_norm_trans)
+            x_hat = GD(g_y,g_p,ref_ps, xfs, flows, masks, attn_norm_trans)
         else:
             x_hat = GD(xfs, flows, masks, attn_norm_trans)
         model_G_end = time.time()
@@ -937,9 +1160,9 @@ def test(opt):
         pbar.set_postfix_str(post_fix_str)
         visual_start = time.time()
 
-        full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
-                    ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
-                        gp=None,gp_hat=None,flows=flows, masks_normed=attn_norm_trans, occlusions=masks, ref_features=xfs, g_features=gf)
+        full_img,simp_img, out_img = get_layer_warp_K_visualize_result(opt, \
+                ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=ref_ps, gx=g_x, x_hat=x_hat, gy=g_y,\
+                    gp=g_p,flows=flows, masks=masks, attns=attn_norm_trans, ref_features=xfs, g_features=gf)
         visual_end = time.time()
         # print('visual time:%.3f'%(visual_end-visual_start))
         
@@ -950,14 +1173,16 @@ def test(opt):
             test_name += str(froms[k][0])+'+'
         test_name += str(to[0])
         from PIL import Image
-        Image.fromarray(out_img).save(os.path.join(test_result_eval_dir,"{0}_vis.jpg".format(test_name)))
         Image.fromarray(simp_img).save(os.path.join(test_result_dir,"{0}_simp.jpg".format(test_name)))
+        Image.fromarray(out_img).save(os.path.join(test_result_eval_dir,"{0}_vis.jpg".format(test_name)))
+
         if opt.output_all:
             Image.fromarray(full_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
         save_end = time.time()
         # print('save time:%.3f'%(save_end-save_start))
         
     pass
+
 
 
 if __name__ == "__main__":
@@ -967,15 +1192,19 @@ if __name__ == "__main__":
     set_random_seed(opt.seed)
     
     if opt.phase == 'train':
-        today = datetime.today().strftime("%Y%m%d")
-        # today = '20201123'
-        experiment_name = '{0}_lsGAN_{1}shot_{2}'.format(opt.id,opt.K, today)
+        # today = datetime.today().strftime("%Y%m%d")
+        today = '20201215'
+        # experiment_name = 'fashion_pretrain_flow_v{0}_{1}shot_{2}'.format(opt.id,opt.K, today)
+        experiment_name = 'fashion_v{0}_{1}shot_{2}'.format(opt.id,opt.K, today)
         print(experiment_name)
         train(opt, experiment_name)
         # train_flow_net(opt, experiment_name)
     else:
         with torch.no_grad():
             test(opt)
+        
+        # with torch.no_grad():
+            # test_flow_net(opt)
 
 
 

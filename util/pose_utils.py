@@ -172,8 +172,40 @@ def draw_legend():
     handles = [mpatches.Patch(color=np.array(color) / 255.0, label=name) for color, name in zip(COLORS, LABELS)]
     plt.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
 
+def get_scale_trans(source_kp:np.ndarray, target_kp:np.ndarray):
 
+    '''
+    get scale and translation from source to target keypoint,
+    use 4 points to compute
+    '''
+    KP = [2,5,8,11] # rs, ls, rh, lh
+    source_central = np.average(source_kp[:,KP],axis=1)
+    target_central = np.average(target_kp[:,KP],axis=1)
+    source_lenth = np.average(np.linalg.norm((source_kp[:,KP] - source_central[:,np.newaxis]),axis=0))
+    target_lenth = np.average(np.linalg.norm((target_kp[:,KP] - target_central[:,np.newaxis]),axis=0))
+    scale = target_lenth / (source_lenth + np.finfo(float).eps)
 
+    # print('scale: ',scale)
+
+    center = np.array([(175+0)/2, (256+0)/2]) # the center of image
+    
+    trans = (target_kp[:,1] - center)/scale + center - source_kp[:,1]
+    # print('trans: ',trans)
+    return scale, trans
+
+def get_dot_sim(source:np.ndarray, target:np.ndarray, norm_value:float, beta1:float, beta2:float):
+    '''
+    @source: H by W by 3 input flow and label features
+    @target: H by W by 3 input flow and label features
+    
+    '''
+    label_diff = np.abs(source[:,:,2]- target[:,:,2])
+    label_diff = np.minimum(label_diff, beta2)/ norm_value
+    label_term = np.exp(- beta1 * label_diff) # H,W
+    
+    flow_term = source[:,:,:2] * target[:,:,:2]
+    flow_term = (np.sum(flow_term, axis=2)+1)/2 # H,W
+    return flow_term,label_term,flow_term*label_term
 
 if __name__ == "__main__":
     import pandas as pd

@@ -262,10 +262,12 @@ def init_flowgenerator(opt, path_to_chkpt):
     image_nc = 3
     structure_nc = 21
     categories = opt.categories
+    flow_layers = [2,3]
+
     if opt.use_simmap:
         image_nc += 13
     
-    GF = PartFlowGenerator(image_nc=image_nc, structure_nc=structure_nc,parsing_nc=categories, n_layers=5, flow_layers= [2,3], ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = PartFlowGenerator(image_nc=image_nc, structure_nc=structure_nc,parsing_nc=categories, n_layers=5, flow_layers=flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     if opt.parallel:
         GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
     GF = GF.to(device)
@@ -306,12 +308,14 @@ def init_generator(opt, path_to_chkpt, path_to_flow_chkpt=None):
     image_nc = 3
     structure_nc = 21
     flow_layers = [2,3]
+    categories = opt.categories
+
     if opt.use_parsing:
         structure_nc += 20
     if opt.use_simmap:
         image_nc += 13
 
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = PartFlowGenerator(image_nc=image_nc, structure_nc=structure_nc, parsing_nc=categories, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     GP = PoseAttnFCNGenerator(structure_nc=structure_nc,n_layers=5, attn_layers= flow_layers, ngf=32, max_nc=256,norm_type=opt.norm_type, activation=opt.activation,use_spectral_norm=opt.use_spectral_G)
 
@@ -855,10 +859,10 @@ def test(opt):
         GD.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
         GP.load_state_dict(checkpoint_G['GP_state_dict'], strict=False)
     epochCurrent = checkpoint_G['epoch']
-    GF.train()
-    GE.train()
-    GD.train()
-    GP.train()
+    GF.eval()
+    GE.eval()
+    GD.eval()
+    GP.eval()
 
     '''Losses'''
     criterionG = LossG(device=device)

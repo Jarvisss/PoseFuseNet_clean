@@ -268,8 +268,6 @@ def get_visualize_result(opt, ref_xs, ref_ys,ref_ps, gx, gy, gp, gp_hat, xf_merg
     return final_img,simp_img, mid_img
 
 
-
-
 def tensor2im(x, display_batch=0, is_parsing=False,is_mask=False, out_size=(256,256)):
     '''
     take 4-d tensor as input, [B C H W]
@@ -282,16 +280,17 @@ def tensor2im(x, display_batch=0, is_parsing=False,is_mask=False, out_size=(256,
     img = torch.ones((out_size[0],out_size[1],3)).to(device) * 255.0
     if x is None:
         return img
-    tensor = x.clone()
+    tensor = x.clone().detach()
     assert len(tensor.shape)==4
     channel = tensor.shape[1]
     if is_parsing:
-        tensor = tensor.detach().to(cpu).numpy()
+        tensor = tensor.to(cpu).numpy()
         img = visualize_parsing(tensor, display_batch)
         img = torch.from_numpy(img).to(device).float()
     elif channel == 1 and is_mask:
         tensor = F.interpolate(tensor, size=out_size, mode='bilinear',align_corners=True)
-        img = tensor[display_batch].permute(1,2,0)
+        # imax = torch.max(tensor)
+        img = tensor[display_batch].permute(1,2,0) 
         img = torch.cat((img,)*3, dim=2) * 255.0
     elif channel == 3:
         # image
@@ -309,6 +308,296 @@ def tensor2im(x, display_batch=0, is_parsing=False,is_mask=False, out_size=(256,
         print('Unknown Shape:',x.shape)
 
     return img
+
+
+def get_layer_warp_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, gy, gp, flows, ref_features=None, g_features=None):
+    r'''a
+    '''
+    assert(opt.K==1)
+    assert(len(ref_xs)==1)
+    assert(len(ref_ys)==1)
+    assert(len(ref_ps)==1)
+    assert(len(flows)==1)
+    # assert(len(ref_features)==1)
+    # assert(len(g_features)==1)
+    
+    C = opt.categories
+    layers = len(flows[0])
+    # assert(len(ref_features[0])==layers)
+    # assert(len(g_features)==layers)
+
+    assert(flows[0][0].shape[1]==C*2)
+    out_size = ref_xs[0].shape[2:]
+    cpu = torch.device("cpu")
+    device = torch.device("cuda:0")
+
+    rows = (C+1)*out_size[0] # C个区域，加1个merge
+    cols = (layers+2)*2*out_size[1]
+
+    white = tensor2im(None, out_size=out_size)
+    visual_ref_x = tensor2im(ref_xs[0], out_size=out_size)
+    visual_ref_y = tensor2im(ref_ys[0], out_size=out_size)
+    if ref_ps is None:
+        visual_ref_p = tensor2im(None, is_parsing=True, out_size=out_size)
+    else:
+        visual_ref_p = tensor2im(ref_ps[0], is_parsing=True, out_size=out_size)
+    
+    visual_g_x = tensor2im(gx, out_size=out_size)
+    visual_g_y = tensor2im(gy, out_size=out_size)
+    visual_gp = tensor2im(gp, is_parsing=True, out_size=out_size) 
+    
+    
+    # 1列refp，1列g_p，1列refx， 1列 g_x
+    visual_ref_p_col = []
+    visual_g_p_col = []
+    visual_ref_x_col = []
+    visual_g_x_col = []
+    for c in range(C):
+        ref_pc = ref_ps[0][:,c:c+1,:,:]
+        g_pc = gp[:,c:c+1,:,:]
+        ref_xc = ref_xs[0] * ref_pc
+        g_xc = gx * g_pc
+
+        visual_ref_p_col += [tensor2im(ref_pc, out_size=out_size, is_mask=True)]
+        visual_g_p_col += [tensor2im(g_pc, out_size=out_size, is_mask=True)]
+        visual_ref_x_col += [tensor2im(ref_xc, out_size=out_size)]
+        visual_g_x_col += [tensor2im(g_xc, out_size=out_size)]
+    
+    visual_ref_p_col += [visual_ref_p]
+    visual_g_p_col += [visual_gp]
+    visual_ref_x_col += [visual_ref_x]
+    visual_g_x_col += [visual_g_x]
+
+    # 中间Layer *2 列
+    warp_p_cols = []
+    warp_x_cols = []
+    visual_warp_p_cols = []
+    visual_warp_x_cols = [] # layers * （C+1）
+    for i in range(layers):
+        warp_p_layer_col = []
+        warp_x_layer_col = []
+        visual_warp_p_layer_col = []
+        visual_warp_x_layer_col = []
+        down_H, down_W = flows[0][i].shape[2:]
+        down_size = (down_H, down_W)
+        for c in range(C):
+            down_ref_pc = F.interpolate(ref_ps[0][:,c:c+1,:,:],size=down_size, mode='bilinear', align_corners=opt.align_corner)
+            down_ref_xc = F.interpolate(ref_xs[0],size=down_size, mode='bilinear', align_corners=opt.align_corner)
+
+            warp_refp_c = warp_flow(down_ref_pc, flows[0][i][:, c*2:c*2+2, :,:], align_corners=opt.align_corner)
+            warp_refx_c = warp_flow(down_ref_xc, flows[0][i][:, c*2:c*2+2, :,:], align_corners=opt.align_corner) * warp_refp_c
+
+            up_ref_p_warp = F.interpolate(warp_refp_c,size=out_size, mode='bilinear', align_corners=opt.align_corner)
+            up_ref_x_warp = F.interpolate(warp_refx_c,size=out_size, mode='bilinear', align_corners=opt.align_corner)
+
+            warp_p_layer_col += [up_ref_p_warp]
+            warp_x_layer_col += [up_ref_x_warp]
+            visual_warp_p_layer_col += [tensor2im(up_ref_p_warp, out_size=out_size, is_mask=True)]
+            visual_warp_x_layer_col += [tensor2im(up_ref_x_warp, out_size=out_size)]
+        
+        warp_p_layer_col_merge = sum(warp_p_layer_col)
+        warp_x_layer_col_merge = sum(warp_x_layer_col)
+        warp_p_layer_col += [warp_p_layer_col_merge]
+        warp_x_layer_col += [warp_x_layer_col_merge]
+        warp_p_cols += [warp_p_layer_col]
+        warp_x_cols += [warp_x_layer_col]
+
+        visual_warp_p_layer_col += [tensor2im(warp_p_layer_col_merge, out_size=out_size, is_mask=True)]
+        visual_warp_x_layer_col += [tensor2im(warp_x_layer_col_merge, out_size=out_size)]
+        visual_warp_p_cols += [visual_warp_p_layer_col]
+        visual_warp_x_cols += [visual_warp_x_layer_col]
+    
+    vis_wp1 = torch.cat(visual_warp_p_cols[0], dim=0)
+    vis_wp2 = torch.cat(visual_warp_p_cols[1], dim=0)
+    vis_wx1 = torch.cat(visual_warp_x_cols[0], dim=0)
+    vis_wx2 = torch.cat(visual_warp_x_cols[1], dim=0)
+
+    vis_refp = torch.cat(visual_ref_p_col, dim=0)
+    vis_gp = torch.cat(visual_g_p_col, dim=0)
+    vis_refx = torch.cat(visual_ref_x_col, dim=0)
+    vis_gx = torch.cat(visual_g_x_col, dim=0)
+
+    final_img = torch.cat((vis_refp, vis_wp1, vis_wp2, vis_gp, vis_refx, vis_wx1, vis_wx2, vis_gx), dim=1)
+
+    assert(final_img.shape[0] == rows)
+    assert(final_img.shape[1] == cols)
+    final_img = final_img.type(torch.uint8).to(cpu).numpy()
+
+    return final_img,None,None # out, simp is None
+        
+
+def get_layer_warp_K_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx,x_hat, gy, gp, flows,masks, attns, ref_features=None, g_features=None):
+    r'''a
+    '''
+    K = opt.K
+    assert(len(ref_xs)==opt.K)
+    assert(len(ref_ys)==opt.K)
+    assert(len(ref_ps)==opt.K)
+    assert(len(flows)==opt.K)
+    assert(len(masks)==opt.K)
+    assert(len(attns)==opt.K)
+    # assert(len(ref_features)==1)
+    # assert(len(g_features)==1)
+    
+    C = opt.categories
+    layers = len(flows[0]) # 这里只可视化一个level的feature，否则太多
+    # assert(len(ref_features[0])==layers)
+    # assert(len(g_features)==layers)
+
+    assert(flows[0][0].shape[1]==C*2)
+    out_size = ref_xs[0].shape[2:]
+    cpu = torch.device("cpu")
+    device = torch.device("cuda:0")
+
+    rows = (C+1)*out_size[0] # C个区域，加1个merge
+    cols = (8*opt.K + 3)*out_size[1]
+
+    white = tensor2im(None, out_size=out_size)
+    visual_ref_xs = [0] * K
+    visual_ref_ys = [0] * K
+    visual_ref_ps = [0] * K
+    for k in range(K):
+        visual_ref_xs[k] = tensor2im(ref_xs[k], out_size=out_size)
+        visual_ref_ys[k] = tensor2im(ref_ys[k], out_size=out_size)
+        if ref_ps is None:
+            visual_ref_ps[k] = tensor2im(None, is_parsing=True, out_size=out_size)
+        else:
+            visual_ref_ps[k] = tensor2im(ref_ps[k], is_parsing=True, out_size=out_size)
+    
+    visual_ref_xs_tensor = torch.cat(visual_ref_xs, dim=1)
+
+    # visual_ref_x = tensor2im(ref_xs[0], out_size=out_size)
+    # visual_ref_y = tensor2im(ref_ys[0], out_size=out_size)
+    # if ref_ps is None:
+    #     visual_ref_p = tensor2im(None, is_parsing=True, out_size=out_size)
+    # else:
+    #     visual_ref_p = tensor2im(ref_ps[0], is_parsing=True, out_size=out_size)
+    
+    visual_g_x = tensor2im(gx, out_size=out_size)
+    visual_g_y = tensor2im(gy, out_size=out_size)
+    visual_gp = tensor2im(gp, is_parsing=True, out_size=out_size) 
+    visual_out = tensor2im(x_hat, out_size=out_size)
+    simp_img = torch.cat((visual_ref_xs_tensor,visual_out,visual_g_x),dim=1).type(torch.uint8).to(cpu).numpy()
+    out_img = visual_out.type(torch.uint8).to(cpu).numpy()
+    if not opt.output_all and not opt.phase=='train':
+        return None, simp_img, out_img
+    
+    # 1列g_p，1列 g_x
+    visual_g_p_col = []
+    visual_g_x_col = []
+    for c in range(C):
+        g_pc = gp[:,c:c+1,:,:]
+        g_xc = gx * g_pc
+        visual_g_p_col += [tensor2im(g_pc, out_size=out_size, is_mask=True)]
+        visual_g_x_col += [tensor2im(g_xc, out_size=out_size)]
+    
+    visual_g_p_col += [visual_gp]
+    visual_g_x_col += [visual_g_x]
+
+    # K列refp，K列refx
+    visual_ref_p_cols = []
+    visual_ref_x_cols = []
+    for k in range(K):
+        visual_ref_p_col = []
+        visual_ref_x_col = []
+
+        for c in range(C):
+            ref_pc = ref_ps[k][:,c:c+1,:,:]
+            ref_xc = ref_xs[k] * ref_pc
+
+            visual_ref_p_col += [tensor2im(ref_pc, out_size=out_size, is_mask=True)]
+            visual_ref_x_col += [tensor2im(ref_xc, out_size=out_size)]
+    
+        visual_ref_p_col += [visual_ref_ps[k]]
+        visual_ref_x_col += [visual_ref_xs[k]]
+
+        visual_ref_p_cols += [visual_ref_p_col]
+        visual_ref_x_cols += [visual_ref_x_col]
+
+    # K列refwp，K列refwx,K列refmp，K列refmx,K列refap，K列refax,
+    visual_warp_p_cols = []
+    visual_warp_x_cols = [] # layers * (C+1)
+    visual_mask_p_cols = []
+    visual_mask_x_cols = []
+    visual_attn_p_cols = []
+    visual_attn_x_cols = []
+
+    for k in range(K):
+        vis_layer = 1
+        visual_warp_p_col = []
+        visual_warp_x_col = []
+        visual_mask_p_col = []
+        visual_mask_x_col = []
+        visual_attn_p_col = []
+        visual_attn_x_col = []
+        flow = flows[k][vis_layer]
+        mask = masks[k][vis_layer]
+        attn = attns[k][vis_layer]
+
+        down_H, down_W = flow.shape[2:]
+        down_size = (down_H, down_W)
+        for c in range(C):
+            down_ref_pc = F.interpolate(ref_ps[k][:,c:c+1,:,:],size=down_size, mode='bilinear', align_corners=opt.align_corner)
+            down_ref_xc = F.interpolate(ref_xs[k],size=down_size, mode='bilinear', align_corners=opt.align_corner)
+
+            warp_refp_c = warp_flow(down_ref_pc, flow[:, c*2:c*2+2, :,:], align_corners=opt.align_corner)
+            warp_refx_c = warp_flow(down_ref_xc, flow[:, c*2:c*2+2, :,:], align_corners=opt.align_corner) * warp_refp_c
+            mask_refx_c = warp_refx_c * mask[:,c:c+1,...]
+            attn_refx_c = warp_refx_c * attn[:,c:c+1,...]
+
+            up_ref_p_warp = F.interpolate(warp_refp_c,size=out_size, mode='bilinear', align_corners=opt.align_corner)
+            up_ref_x_warp = F.interpolate(warp_refx_c,size=out_size, mode='bilinear', align_corners=opt.align_corner)
+
+            visual_warp_p_col += [tensor2im(up_ref_p_warp, out_size=out_size, is_mask=True)]
+            visual_warp_x_col += [tensor2im(up_ref_x_warp, out_size=out_size)]
+            visual_mask_p_col += [tensor2im(mask[:,c:c+1,...] * warp_refp_c, is_mask=True)]
+            visual_mask_x_col += [tensor2im(mask_refx_c, out_size=out_size)]
+            visual_attn_p_col += [tensor2im(attn[:,c:c+1,...] * warp_refp_c, is_mask=True)]
+            visual_attn_x_col += [tensor2im(attn_refx_c, out_size=out_size)]
+
+        visual_warp_p_col += [white]
+        visual_warp_x_col += [white]
+        visual_mask_p_col += [white]
+        visual_mask_x_col += [white]
+        visual_attn_p_col += [white]
+        visual_attn_x_col += [white]
+
+        visual_warp_p_cols += [visual_warp_p_col]
+        visual_warp_x_cols += [visual_warp_x_col]
+        visual_mask_p_cols += [visual_mask_p_col]
+        visual_mask_x_cols += [visual_mask_x_col]
+        visual_attn_p_cols += [visual_attn_p_col]
+        visual_attn_x_cols += [visual_attn_x_col]
+
+
+    vis_ks = []
+    for k in range(K):
+        vis_rp = torch.cat(visual_ref_p_cols[k], dim=0)
+        vis_rx = torch.cat(visual_ref_x_cols[k], dim=0)
+        vis_wp = torch.cat(visual_warp_p_cols[k], dim=0)
+        vis_wx = torch.cat(visual_warp_x_cols[k], dim=0)
+        vis_mp = torch.cat(visual_mask_p_cols[k], dim=0)
+        vis_mx = torch.cat(visual_mask_x_cols[k], dim=0)
+        vis_ap = torch.cat(visual_attn_p_cols[k], dim=0)
+        vis_ax = torch.cat(visual_attn_x_cols[k], dim=0)
+        vis_k = torch.cat((vis_rp, vis_wp, vis_mp,vis_ap, vis_rx, vis_wx,vis_mx, vis_ax), dim=1)
+        vis_ks += [vis_k]
+
+    vis_ks = torch.cat(vis_ks, dim=1)
+    vis_gp = torch.cat(visual_g_p_col, dim=0)
+    vis_gx = torch.cat(visual_g_x_col, dim=0)
+
+
+    for r in range(C):
+        visual_out = torch.cat((white, visual_out), dim=0)
+
+    final_img = torch.cat((vis_ks, vis_gp, visual_out, vis_gx), dim=1)
+
+    assert(final_img.shape[0] == rows)
+    assert(final_img.shape[1] == cols)
+    final_img = final_img.type(torch.uint8).to(cpu).numpy()
+
+    return final_img,simp_img,out_img # out, simp is None
 
 
 def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp, gp_hat, flows, masks_normed,occlusions, ref_features, g_features):
@@ -329,7 +618,6 @@ def get_pyramid_visualize_result(opt, ref_xs, ref_ys, ref_ps, gx, x_hat,  gy, gp
 
     cpu = torch.device("cpu")
     device = torch.device("cuda:0")
-    DISPLAY_BATCH = 0
 
     K = len(ref_xs)
     assert(len(ref_ys)==K)

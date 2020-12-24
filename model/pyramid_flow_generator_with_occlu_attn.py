@@ -364,6 +364,10 @@ class PoseAwareAppearanceDecoder(nn.Module):
                 # ResBlockUpNorm(ngf*mult_prev, ngf*mult, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
             )
             setattr(self, 'decoder'+str(i), up)
+            if self.n_decode_layers-i in self.flow_layers:
+                selfattn = SelfAttention(ngf*mult)
+                setattr(self, 'sa'+str(i), selfattn)
+
         
         self.outconv = Output(ngf, output_nc, 3, None, nonlinearity, use_spectral_norm, False)
         if self.use_resample:
@@ -409,6 +413,8 @@ class PoseAwareAppearanceDecoder(nn.Module):
                         merge += out_k
                 counter += 1
                 out = merge
+                sa_layer = getattr(self, 'sa'+str(i))
+                out = sa_layer(out)
             
             out = model(out)
         out_image = self.outconv(out)

@@ -7,6 +7,8 @@ import cv2
 import torchvision.transforms.functional as F
 from util import openpose_utils, pose_utils
 from PIL import Image, ImageDraw
+from numpy import dot
+from numpy.linalg import norm
 import random
 import json
 import sys
@@ -30,7 +32,12 @@ class FashionDataset(data.Dataset):
     @ path_to_test_anno
         the path to test image keypoint annotations
     """
-    def __init__(self, phase,  path_to_train_tuples, path_to_test_tuples, path_to_train_imgs_dir, path_to_train_anno, path_to_test_imgs_dir, path_to_test_anno, opt,path_to_train_parsings_dir=None,path_to_test_parsings_dir=None, load_size=256, pose_scale=255.0):
+    def __init__(self, phase,  path_to_train_tuples, path_to_test_tuples, 
+    path_to_train_imgs_dir, path_to_train_anno, 
+    path_to_test_imgs_dir, path_to_test_anno, opt,
+    path_to_train_label_dir=None, path_to_test_label_dir=None,
+    path_to_train_parsings_dir=None,path_to_test_parsings_dir=None, 
+    load_size=256, pose_scale=255.0):
         super(FashionDataset, self).__init__()
         
         self._is_train = phase == 'train'
@@ -38,6 +45,7 @@ class FashionDataset(data.Dataset):
         self._train_anno = pd.read_csv(path_to_train_anno, sep=':')
         self._train_img_dir = path_to_train_imgs_dir
         self._train_parsing_dir = path_to_train_parsings_dir
+        self._train_label_dir = path_to_train_label_dir
         print ("--------------- Dataset Info: ---------------")
         print ("Phase: %s" % phase)
         print ("Number of tuples train: %s" % len(self._train_tuples))
@@ -45,7 +53,7 @@ class FashionDataset(data.Dataset):
         self._test_tuples = pd.read_csv(path_to_test_tuples)
         self._test_anno = pd.read_csv(path_to_test_anno, sep=':')
         self._test_img_dir = path_to_test_imgs_dir
-        self._test_parsing_dir = path_to_test_parsings_dir
+        self._test_label_dir = path_to_test_label_dir
         print ("Number of tuples test: %s" % len(self._test_tuples))
         # self._test_tuples = pd.read_csv(path_to_train_tuples)
         # self._test_anno = pd.read_csv(path_to_test_anno, sep=':')
@@ -78,7 +86,12 @@ class FashionDataset(data.Dataset):
         self.pose_scale = pose_scale
         self.align_corner = opt.align_corner
         self.use_parsing = opt.use_parsing
+        self.use_tps_sim = opt.use_tps_sim
+        self.tps_sim_beta1 = opt.tps_sim_beta1
+        self.tps_sim_beta2 = opt.tps_sim_beta2
         self.affine_param = self.getRandomAffineParam()
+
+        self.joints_for_cos_sim = opt.joints_for_cos_sim if hasattr(opt, 'joints_for_cos_sim') else 4
 
 
 
@@ -110,7 +123,7 @@ class FashionDataset(data.Dataset):
         return image  
 
     def load_image(self, tuple_df, direction='', affine=None):
-        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)]
+        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)] + ['from']
         
         if self._is_train: 
             A_path = os.path.join(self._train_img_dir, tuple_df[direction])
@@ -123,8 +136,15 @@ class FashionDataset(data.Dataset):
 
         return Ai
 
+    def load_keypoints(self, tuple_df, direction='', affine_matrix=None):
+        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)]  + ['from']
+        row = self._annotation_file.loc[tuple_df[direction]]
+        kp_array = pose_utils.load_pose_cords_from_strings(row['keypoints_y'], row['keypoints_x']) #[18,2]
+
+        return kp_array.transpose()
+
     def load_skeleton(self, tuple_df, direction='', affine_matrix=None):
-        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)]
+        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)]  + ['from']
         row = self._annotation_file.loc[tuple_df[direction]]
         kp_array = pose_utils.load_pose_cords_from_strings(row['keypoints_y'], row['keypoints_x']) #[18,2]
 
@@ -143,10 +163,21 @@ class FashionDataset(data.Dataset):
             color = torch.Tensor(color)
             Bi = torch.cat((Bi, color), dim=0)
         
-        return Bi,torch.Tensor(kp_array.transpose())
+        return Bi
     
+    def load_tps_label(self,tuple_df, direction=''):
+        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)] + ['from']
+        if self._is_train: 
+            label_path = os.path.join(self._train_label_dir, tuple_df[direction].replace('.jpg','_sim.npy'))
+        else:
+            label_path = os.path.join(self._test_label_dir, tuple_df[direction].replace('.jpg','_sim.npy'))
+        
+        label = np.load(label_path)
+        # label = torch.Tensor(label).permute(2,0,1)
+        return label
+
     def load_parsing(self, tuple_df, direction='' ,categories=8, affine=None):
-        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)]
+        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)] + ['from']
         if self._is_train: 
             parsing_path = os.path.join(self._train_parsing_dir, tuple_df[direction].replace('.jpg','_merge.png'))
         else:
@@ -247,6 +278,158 @@ class FashionDataset(data.Dataset):
         
         return similarity_maps
     
+    # input two
+    def get_cosine_similarity(self, vector1, vector2):
+        cos = torch.nn.CosineSimilarity(dim=0)
+        cos_sim = cos(vector1,vector2)
+        return cos_sim
+
+    def get_warp_grid(self, scale, trans, grid_size):
+        H, W = grid_size
+        theta = torch.zeros((2,3))
+        theta[0,0] = 1/scale
+        theta[0,2] = -2 * trans[0]/ W
+        theta[1,1] = 1/scale
+        theta[1,2] = -2 * trans[1]/ H
+        theta = theta.unsqueeze(0)
+        grid = torch.nn.functional.affine_grid(theta,[1,3,H,W],align_corners=self.align_corner)
+        return grid
+
+    def get_tps_similarity(self, gt_y, ref_ys, gt_label, ref_labels):
+        '''
+        gt_y: [2,18] tensor
+        ref_ys: K * [2,18] tensor
+        gt_label: [anno_size , 3] tensor
+        ref_labels: K * [anno_size , 3] tensor
+
+        return: K*[1, load_size] tensor
+        '''
+        sims = []
+        
+        for i in range(len(ref_ys)):
+            scale, trans = pose_utils.get_scale_trans(ref_ys[i][::-1,:],gt_y[::-1,:]) # y,x to x,y
+            grid = self.get_warp_grid(scale, trans, self.anno_size)
+
+            ref_affine_tensor = torch.nn.functional.grid_sample(torch.Tensor(ref_labels[i]).unsqueeze(0).permute(0,3,1,2), grid, padding_mode='border',align_corners=self.align_corner)
+            ref_affine = ref_affine_tensor.permute(0,2,3,1)[0].numpy()
+            ref_affine_norm = np.linalg.norm(ref_affine[:,:,0:2], axis=2)
+            ref_affine[:,:,0] /= (ref_affine_norm+np.finfo(float).eps)
+            ref_affine[:,:,1] /= (ref_affine_norm+np.finfo(float).eps)
+
+            _,_,sim = pose_utils.get_dot_sim(ref_affine, gt_label, norm_value=17, beta1=self.tps_sim_beta1, beta2=self.tps_sim_beta2)
+            sims += [sim] # [anno_size]
+        sims_sum = sum(sims)
+        sims = [torch.Tensor(sim / (sims_sum+np.finfo(float).eps)) for sim in sims] # normlize to sum 1
+        sims = [F.resize(sim.unsqueeze(0), self.load_size, interpolation=Image.BILINEAR) for sim in sims]
+        sims = [sim for sim in sims]
+        assert(sims[0].shape == (1,256,256))
+        return sims 
+
+    def get_similarity_value(self, gt, refs):
+        '''
+        gt: [2,18] tensor
+        refs: K * [2,18] tensor
+        '''
+        # LIMB_SEQ = [[1,2], [1,5], [2,3], [3,4], [5,6], [6,7], [1,8], [8,9],
+        #    [9,10], [1,11], [11,12], [12,13], [1,0], [0,14], [14,16],
+        #    [0,15], [15,17], [2,16], [5,17]]  # fasion limbs , 计算向量
+
+        # LIMB_SEQ = [[1,2], [1,5],  [1,8], [1,11]]  # fasion limbs , 计算向量
+        LIMB_SEQ = [[1,2], [1,5]]  # fasion limbs , 计算向量
+        g_dirs = None
+        for limb in LIMB_SEQ:
+            g_dir = gt[:,limb[1]] - gt[:, limb[0]]
+            if g_dirs ==None:
+                g_dirs = g_dir
+            else:
+                g_dirs = torch.cat((g_dirs, g_dir),dim=0)
+        cosine_similarities = []
+        for ref in refs:
+            ref_dirs = None
+            for i,limb in enumerate(LIMB_SEQ):
+                ref_dir = ref[:,limb[1]] - ref[:, limb[0]]
+                
+                if ref_dirs ==None:
+                    ref_dirs = ref_dir
+                else:
+                    ref_dirs = torch.cat((ref_dirs, ref_dir),dim=0)
+            cos = self.get_cosine_similarity(g_dirs, ref_dirs) /2 + 0.5
+            cosine_similarities += [cos]
+        return cosine_similarities
+    
+    def get_dot_sim(self, source:np.ndarray, target:np.ndarray, norm_value:float, beta1:float, beta2:float):
+        '''
+        @source: H by W by 3 input flow and label features
+        @target: H by W by 3 input flow and label features
+        
+        '''
+        label_diff = np.abs(source[:,:,2]- target[:,:,2])
+        label_diff = np.minimum(label_diff, beta2)/ norm_value
+        label_term = np.exp(- beta1 * label_diff) # H,W
+        
+        flow_term = source[:,:,:2] * target[:,:,:2]
+        flow_term = (np.sum(flow_term, axis=2)+1)/2 # H,W
+        return flow_term,label_term,flow_term*label_term
+        
+
+    def get_normalized_Cosinesimilarity_value(self, gt, refs):
+        '''
+        gt: [2,18] tensor
+        refs: K * [2,18] tensor
+        return: K *[1, load_size ] tensor
+        '''
+        gt = torch.Tensor(gt)
+        refs = [torch.Tensor(ref) for ref in refs]
+        if self.joints_for_cos_sim == -1:
+            LIMB_SEQ = [[1,2], [1,5], [2,3], [3,4], [5,6], [6,7], [1,8], [8,9],
+            [9,10], [1,11], [11,12], [12,13], [1,0], [0,14], [14,16],
+            [0,15], [15,17], [2,16], [5,17]]  # fasion limbs , 计算向量
+        elif self.joints_for_cos_sim == 4:
+            LIMB_SEQ = [[1,2], [1,5],  [1,8], [1,11]]  # fasion limbs , 计算向量
+        else:
+            raise NotImplementedError
+        # LIMB_SEQ = [[1,2], [1,5]]  # fasion limbs , 计算向量
+        cos = torch.nn.CosineSimilarity(dim=0)
+        g_dirs = []
+        MISSING_VALUE = -1
+        MISSING_CORD = torch.Tensor([MISSING_VALUE,MISSING_VALUE])
+        MISSING_DIR = torch.Tensor([self.load_size[0]+1, self.load_size[1]+1])
+        for limb in LIMB_SEQ:
+            g_dir = gt[:,limb[1]] - gt[:, limb[0]]
+            if torch.allclose(gt[:,limb[1]], MISSING_CORD) or torch.allclose(gt[:,limb[0]], MISSING_CORD):
+                g_dir = MISSING_DIR
+            
+            g_dirs += [g_dir]
+        
+        cosine_similarities = []
+        for ref in refs:
+            ref_dirs = None
+            cosines = []
+            for i,limb in enumerate(LIMB_SEQ):
+                ref_dir = ref[:,limb[1]] - ref[:, limb[0]]
+                if torch.allclose(ref[:,limb[1]], MISSING_CORD) or torch.allclose(ref[:,limb[0]], MISSING_CORD):
+                    ref_dir = MISSING_DIR
+
+                if torch.allclose(g_dirs[i], MISSING_DIR) or torch.allclose(ref_dir, MISSING_DIR):
+                    continue
+                else:
+                    cosine = cos(g_dirs[i], ref_dir)
+
+                cosines += [(cosine+1)/2]
+                if ref_dirs ==None:
+                    ref_dirs = ref_dir
+                else:
+                    ref_dirs = torch.cat((ref_dirs, ref_dir),dim=0)
+            avg_cosine = sum(cosines) / len(cosines)
+            cosine_similarities += [avg_cosine]
+        
+        # normalize to 1
+        sum_cosine_sim = 0
+        order = 3
+        for a in cosine_similarities:
+            sum_cosine_sim += a ** order 
+        normed_cosine = [a ** order / sum_cosine_sim * torch.ones(1, self.load_size[0],self.load_size[1]) for a in cosine_similarities]
+        return normed_cosine 
 
     def __len__(self):
         return self.size
@@ -259,40 +442,54 @@ class FashionDataset(data.Dataset):
         else:
             tuple_df = self._test_tuples.iloc[idx]
         
-        from_names = [tuple_df[from_idx].split('.')[0] for from_idx in ['from_'+str(i) for i in range(self._nb_inputs)] ]
+        if self._nb_inputs == 1:
+            from_names = [tuple_df['from'].split('.')[0]]
+            from_indices = ['from']
+        else:
+            from_names = [tuple_df[from_idx].split('.')[0] for from_idx in ['from_'+str(i) for i in range(self._nb_inputs)] ]
+            from_indices = ['from_'+str(i) for i in range(self._nb_inputs)]
+
         to_name = tuple_df['to'].split('.')[0]
         
         # center = (self.load_size[0] * 0.5 + 0.5, self.load_size[1] * 0.5 + 0.5)
         # affine_param = self.getRandomAffineParam()
         # affine_matrix = self.get_affine_matrix(center=center, angle=affine_param['angle'], translate=affine_param['shift'], scale=affine_param['scale'], shear=0)
-        ref_xs = [self.load_image(tuple_df, from_idx) for from_idx in ['from_'+str(i) for i in range(self._nb_inputs)]]
+        ref_xs = [self.load_image(tuple_df, from_idx) for from_idx in from_indices]
         g_x = self.load_image(tuple_df, 'to')
         image_end = time.time()
 
-        ref_skeletons = [self.load_skeleton(tuple_df, from_idx) for from_idx in ['from_'+str(i) for i in range(self._nb_inputs)]]
+        ref_skeletons = [self.load_skeleton(tuple_df, from_idx) for from_idx in from_indices]
+        ref_js = [self.load_keypoints(tuple_df, from_idx) for from_idx in from_indices]
         g_skeleton = self.load_skeleton(tuple_df, 'to')
+        g_j = self.load_keypoints(tuple_df, 'to')
 
-        ref_parsings = [self.load_parsing(tuple_df, from_idx, categories=self._parsing_categories) for from_idx in ['from_'+str(i) for i in range(self._nb_inputs)]] if self.use_parsing else None
+        ref_parsings = [self.load_parsing(tuple_df, from_idx, categories=self._parsing_categories) for from_idx in from_indices] if self.use_parsing else None
         g_parsing = self.load_parsing(tuple_df, 'to', categories=self._parsing_categories) if self.use_parsing else None
 
+        ref_tps_labels = [self.load_tps_label(tuple_df, from_idx) for from_idx in from_indices]  if self.use_tps_sim else None
+        g_tps_label = self.load_tps_label(tuple_df, 'to') if self.use_tps_sim else None
+
         # print('get image item time:%.3f'%(image_end-start))
-        ref_ys = [ref_skeletons[i][0] for i in range(len(ref_skeletons))]
-        ref_js = [ref_skeletons[i][1] for i in range(len(ref_skeletons))]
+        ref_ys = [ref_skeletons[i] for i in range(len(ref_skeletons))]
         
-        g_y = g_skeleton[0]
-        g_j = g_skeleton[1]
-        
+        g_y = g_skeleton
+        # print(g_j.data.numpy())
+        # print(to_name)
         structure_end = time.time()
         # print('get structure item time:%.3f'%(structure_end-image_end))
         # affine_param = self.getRandomAffineParam()
         # affine_matrix = self.get_affine_matrix(center=center, angle=affine_param['angle'], translate=affine_param['shift'], scale=affine_param['scale'], shear=0)
-
+        # similarities = self.get_similarity_value(g_j, ref_js)
+        if not self.use_tps_sim:
+            similarities = self.get_normalized_Cosinesimilarity_value(g_j, ref_js) 
+        else: 
+            similarities = self.get_tps_similarity(g_j, ref_js, g_tps_label,ref_tps_labels)
         end = time.time()
         # print('get item time:%.3f'%(end-start))
         if self.use_parsing:
-            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'ref_ps':ref_parsings, 'g_x':g_x, 'g_y':g_y,  'g_p':g_parsing, 'froms':from_names, 'to':to_name}
+            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'ref_ps':ref_parsings, 'g_x':g_x, 'g_y':g_y,  'g_p':g_parsing, 'froms':from_names, 'to':to_name, 'sim':similarities}
         else:
-            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'g_x':g_x, 'g_y':g_y, 'froms':from_names, 'to':to_name}
+            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'g_x':g_x, 'g_y':g_y, 'froms':from_names, 'to':to_name, 'sim':similarities}
 
     def get_affine_matrix(self, center, angle, translate, scale, shear):
         matrix_inv = self.get_inverse_affine_matrix(center, angle, translate, scale, shear)
@@ -347,4 +544,6 @@ class FashionDataset(data.Dataset):
         matrix[2] += center[0]
         matrix[5] += center[1]
         return matrix
+
+
 

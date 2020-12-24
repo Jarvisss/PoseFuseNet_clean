@@ -7,6 +7,7 @@ from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
 from skimage.measure import compare_ssim
 from skimage.measure import compare_psnr
+from skimage import transform
 import glob
 import argparse
 import matplotlib.pyplot as plt
@@ -19,6 +20,26 @@ import imageio
 from skimage.draw import circle, line_aa, polygon
 from tqdm import tqdm
 
+
+resize_and_padding = True # 我们只对ssim等metrics做padding，为了公平对比
+ori_shape = [256,176]
+if resize_and_padding:
+    metrics_save_name = 'metrics_pad.npz'
+    stats_save_name = 'statistics_pad.npz'
+else:
+    metrics_save_name = 'metrics.npz'
+    stats_save_name = 'statistics.npz'
+
+def addBounding(image, bound=40):
+    h, w, c = image.shape
+    assert(h==256)
+    assert(w==176)
+    assert(c==3)
+    image_bound = np.ones((h, w+bound*2, c))*255
+    # image_bound = image_bound.astype(np.uint8)
+    image_bound[:, bound:bound+w] = image
+
+    return image_bound
 
 
 class FID():
@@ -94,7 +115,7 @@ class FID():
 
 
     def compute_statistics_of_path(self, path, verbose):
-        npz_file = os.path.join(path, 'statistics.npz')
+        npz_file = os.path.join(path, stats_save_name)
         if os.path.exists(npz_file):
             f = np.load(npz_file)
             m, s = f['mu'][:], f['sigma'][:]
@@ -179,6 +200,9 @@ class FID():
             end = start + self.batch_size
 
             files = image_paths[start:end]
+            # if resize_and_padding:
+            #     imgs = np.array([addBounding(transform.resize(imread(str(fn)).astype(np.float32), output_shape=ori_shape)) for fn in files])
+            # else:
             imgs = np.array([imread(str(fn)).astype(np.float32) for fn in files])
             # Bring images to shape (B, 3, H, W)
             imgs = imgs.transpose((0, 3, 1, 2))
@@ -316,7 +340,7 @@ class Reconstruction_Metrics():
             gt_image_list = get_image_list(gts)
         # print('pred len:',len(input_image_list))
         # print('gt len:',len(gt_image_list))
-        npz_file = os.path.join(save_path, 'metrics.npz')
+        npz_file = os.path.join(save_path, metrics_save_name)
         if os.path.exists(npz_file):
             f = np.load(npz_file)
             psnr,ssim,ssim_256,mae,l1=f['psnr'],f['ssim'],f['ssim_256'],f['mae'],f['l1']
@@ -334,8 +358,13 @@ class Reconstruction_Metrics():
 
                 # print(gt_image_list[index])
                 # print(input_image_list[index])
-                img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
-                img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
+                if resize_and_padding:
+                    img_gt   = addBounding( transform.resize((imread(str(gt_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
+                    img_pred = addBounding( transform.resize((imread(str(input_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
+                else:
+                    img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
+                    img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
+                
 
                 if debug != 0:
                     plt.subplot('121')
@@ -368,7 +397,7 @@ class Reconstruction_Metrics():
                     )
             
             if save_path:
-                np.savez(save_path + '/metrics.npz', psnr=psnr, ssim=ssim, ssim_256=ssim_256, mae=mae, l1=l1, names=names) 
+                np.savez(save_path + '/'+metrics_save_name, psnr=psnr, ssim=ssim, ssim_256=ssim_256, mae=mae, l1=l1, names=names) 
 
         print(
             "PSNR: %.4f" % round(np.mean(psnr), 4),
@@ -434,8 +463,8 @@ def preprocess_path_for_deform_task(gt_path, distorted_path):
 
     for distorted_image in distorted_image_list:
         image = os.path.basename(distorted_image)
-        # image = image.split('+')[-1]
-        # image = image.split('_vis')[0] +'.jpg'
+        image = image.split('+')[-1]
+        image = image.split('_vis')[0] +'.jpg'
         gt_image = os.path.join(gt_path, image)
         if not os.path.isfile(gt_image):
             print(gt_image)
@@ -470,18 +499,9 @@ class LPIPS():
             files_1 = get_image_list(path_1)
             files_2 = get_image_list(path_2)
 
-
-        imgs_1 = np.array([imread(str(fn)).astype(np.float32)/127.5-1 for fn in files_1])
-        imgs_2 = np.array([imread(str(fn)).astype(np.float32)/127.5-1 for fn in files_2])
-
-        # Bring images to shape (B, 3, H, W)
-        imgs_1 = imgs_1.transpose((0, 3, 1, 2))
-        imgs_2 = imgs_2.transpose((0, 3, 1, 2))
-
         result=[]
-
-
-        d0 = imgs_1.shape[0]
+        d0 = len(files_1)
+        assert(len(files_2)==d0)
         if batch_size > d0:
             print(('Warning: batch size is bigger than the data size. '
                    'Setting batch size to data size'))
@@ -499,9 +519,22 @@ class LPIPS():
             start = i * batch_size
             end = start + batch_size
 
-            img_1_batch = torch.from_numpy(imgs_1[start:end]).type(torch.FloatTensor)
-            img_2_batch = torch.from_numpy(imgs_2[start:end]).type(torch.FloatTensor)
-
+            files1batch = files_1[start:end]
+            files2batch = files_2[start:end]
+            # LPIPS需要对图像归一化到-1,1来跑
+            # if resize_and_padding:
+            #     img_1_batch = np.array([addBounding(transform.resize(imread(str(fn)).astype(np.float32)/127.5-1, output_shape=ori_shape)) for fn in files1batch])
+            #     img_2_batch = np.array([addBounding(transform.resize(imread(str(fn)).astype(np.float32)/127.5-1, output_shape=ori_shape)) for fn in files2batch])
+            # else:
+            img_1_batch = np.array([imread(str(fn)).astype(np.float32)/127.5-1 for fn in files1batch])
+            img_2_batch = np.array([imread(str(fn)).astype(np.float32)/127.5-1 for fn in files2batch])
+            
+            img_1_batch = img_1_batch.transpose((0, 3, 1, 2))
+            img_2_batch = img_2_batch.transpose((0, 3, 1, 2))
+            img_1_batch = torch.from_numpy(img_1_batch).type(torch.FloatTensor)
+            img_2_batch = torch.from_numpy(img_2_batch).type(torch.FloatTensor)
+            
+            
             if self.use_gpu:
                 img_1_batch = img_1_batch.cuda()
                 img_2_batch = img_2_batch.cuda()
@@ -535,6 +568,11 @@ class LPIPS():
         for i in range(len(files_1)):
             string = annotation_file.loc[os.path.basename(files_2[i])]
             mask = np.tile(np.expand_dims(create_masked_image(string).astype(np.float32), -1), (1,1,3))#.repeat(1,1,3)
+            addBounding(transform.resize(imread(str(fn)).astype(np.float32), output_shape=ori_shape))
+            # if resize_and_padding:
+            #     imgs_1.append( ( addBounding( transform.resize( imread(str(files_1[i])).astype(np.float32), output_shape=ori_shape ) ) /127.5-1) *mask)
+            #     imgs_2.append( ( addBounding( transform.resize( imread(str(files_2[i])).astype(np.float32), output_shape=ori_shape ) ) /127.5-1) *mask)
+            # else:
             imgs_1.append((imread(str(files_1[i])).astype(np.float32)/127.5-1)*mask)
             imgs_2.append((imread(str(files_2[i])).astype(np.float32)/127.5-1)*mask)
 
@@ -657,11 +695,11 @@ if __name__ == "__main__":
 
     print('calculate fid metric...')
     fid_score = fid.calculate_from_disk(args.distorated_path, args.fid_real_path)
-    gt_list, distorated_list = preprocess_path_for_deform_task(args.gt_path, args.distorated_path)
+    gt_list, distorated_list = preprocess_path_for_deform_task(args.gt_path, args.distorated_path) # 让两个list一致
     print('calculate reconstruction metric...')
     rec_dic = rec.calculate_from_disk(distorated_list, gt_list, save_path=args.distorated_path, sort=False, debug=False)
     print('calculate LPIPS...')
-    lpips_score = lpips.calculate_from_disk(distorated_list, gt_list, sort=False, verbose=True, batch_size=16)
+    lpips_score = lpips.calculate_from_disk(distorated_list, gt_list, sort=False, verbose=True, batch_size=64)
     if args.calculate_mask:
         mask_lpips_score = lpips.calculate_mask_lpips(distorated_list, gt_list, sort=False)
 
