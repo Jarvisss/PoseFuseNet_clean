@@ -38,6 +38,13 @@ class ParsingLoss(nn.Module):
         loss_ce = self.ceLoss(logits, target)
         return loss_ce
 
+# class MaskLoss(nn.Module):
+#     def __init__(self, device):
+#         super(MaskLoss, self).__init__()
+#         self.bceloss = nn.BCELoss().to(device)
+#     def forward(self, source, target):
+#         loss_bce = self.bceloss(source, target)
+#         return loss_bce
 
 class MultiAffineRegularizationLoss(nn.Module):
     def __init__(self, kz_dic):

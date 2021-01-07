@@ -9,8 +9,109 @@ Input source feature and target feature at level L, L assume to be 4
 class FlowGenerator(nn.Module):
     """Flow Generator
     """
-    def __init__(self, image_nc=3, structure_nc=21, n_layers=5, flow_layers=[2,3], ngf=32, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True):
+    def __init__(self, inc=3+21+22, n_layers=5, flow_layers=[2,3], ngf=32, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True):
         super(FlowGenerator, self).__init__()
+        norm_layer = get_norm_layer(norm_type=norm_type)
+        nonlinearity = get_nonlinearity_layer(activation_type=activation)
+        self.inc = inc
+        self.ngf = ngf
+        self.norm_type = norm_type
+
+        self.max_nc = max_nc
+        self.encoder_layers = n_layers
+        self.decoder_layers = 1 + len(flow_layers)
+        self.flow_layers = flow_layers
+
+        self._make_layers(self.ngf, self.max_nc, norm_layer, nonlinearity, use_spectral_norm)
+
+
+    def _make_layers(self, ngf, max_nc, norm_layer, nonlinearity, use_spectral_norm):
+        inc = self.inc
+        self.block0 = ResBlockEncoder(inc, ngf, ngf, norm_layer, nonlinearity, use_spectral_norm)
+        mult = 1
+        for i in range(1, self.encoder_layers):
+            mult_prev = mult
+            mult = min(2 ** i, max_nc//ngf)
+            block = ResBlockEncoder(ngf*mult_prev, ngf*mult, ngf*mult, norm_layer, nonlinearity, use_spectral_norm)    
+            setattr(self, 'encoder' + str(i), block)
+        
+        '''32, 64, 128, 256, 256
+        128, 64, 32, 16, 8
+        '''
+
+        for i in range(self.decoder_layers):
+            mult_prev = mult
+            mult = min(2 ** (self.encoder_layers-i-2), max_nc//ngf) if i != self.encoder_layers-1 else 1
+            block = ResBlockUpNorm(ngf*mult_prev, ngf*mult, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+            setattr(self, 'decoder' + str(i), block)
+
+            jumpconv = Jump(ngf*mult, ngf*mult, 3, None, nonlinearity, use_spectral_norm, False)
+            setattr(self, 'jump'+str(i), jumpconv)
+
+            if self.encoder_layers-i-1 in self.flow_layers:
+                flow_out = nn.Conv2d(ngf*mult, 2, kernel_size=3,stride=1,padding=1,bias=True)
+                setattr(self, 'flow' + str(i), flow_out)
+
+                flow_mask = nn.Sequential(nn.Conv2d(ngf*mult, 1, kernel_size=3,stride=1,padding=1,bias=True),
+                                          nn.Sigmoid())
+                setattr(self, 'mask' + str(i), flow_mask)
+
+                flow_attn = nn.Conv2d(ngf*mult, 1, kernel_size=3,stride=1,padding=1,bias=True)
+                setattr(self, 'attn'+str(i), flow_attn)
+        
+        '''256, 128, 64
+        16, 32, 64
+        '''
+        pass
+    
+    '''Get flow and mask at certain layer, [32,32,128] [64,64,64]
+    '''
+    def forward(self, image1, pose1, pose2, sim_map=None):
+        if sim_map is None:
+            x_in = torch.cat((image1, pose1, pose2), dim=1) # (43, 256, 256)
+        else:
+            x_in = torch.cat((image1, pose1, pose2, sim_map), dim=1) # (43+13, 256, 256)
+
+        flow_fields=[]
+        masks=[]
+        attns=[]
+
+        out = self.block0(x_in)
+        result = [out]
+        
+        for i in range(1, self.encoder_layers):
+            model = getattr(self, 'encoder' + str(i))
+            out = model(out)
+            result.append(out) 
+        for i in range(self.decoder_layers):
+            model = getattr(self, 'decoder' + str(i))
+            out = model(out)
+
+            model = getattr(self, 'jump' + str(i))
+            jump = model(result[self.encoder_layers-i-2])
+            out = out+jump
+
+            if self.encoder_layers-i-1 in self.flow_layers:
+                model = getattr(self, 'flow'+str(i))
+                flow_field = model(out)
+                model = getattr(self, 'mask'+str(i))
+                mask = model(out)
+                model = getattr(self, 'attn'+str(i))
+                attn = model(out)
+
+                flow_fields.append(flow_field)
+                masks.append(mask)
+                attns.append(attn)
+
+        return flow_fields, masks, attns
+
+
+class FlowGeneratorWithMask(nn.Module):
+    '''
+    generate flow with mask
+    '''
+    def __init__(self, image_nc=3, structure_nc=21, n_layers=5, flow_layers=[2,3], ngf=32, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True):
+        super(FlowGeneratorWithMask, self).__init__()
         norm_layer = get_norm_layer(norm_type=norm_type)
         nonlinearity = get_nonlinearity_layer(activation_type=activation)
         self.image_nc = image_nc
@@ -106,19 +207,16 @@ class FlowGenerator(nn.Module):
 
         return flow_fields, masks, attns
 
-
-
-
 #### TODO
 class PoseAttnFCNGenerator(nn.Module):
     '''
     pose attention generator
     '''
-    def __init__(self, structure_nc=21, n_layers=5, attn_layers=[2,3], ngf=32, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True):
+    def __init__(self, inc=21, n_layers=5, attn_layers=[2,3], ngf=32, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True):
         super(PoseAttnFCNGenerator, self).__init__()
         norm_layer = get_norm_layer(norm_type=norm_type)
         nonlinearity = get_nonlinearity_layer(activation_type=activation)
-        self.structure_nc = structure_nc
+        self.inc = inc
         self.ngf = ngf
         self.norm_type = norm_type
 
@@ -130,7 +228,7 @@ class PoseAttnFCNGenerator(nn.Module):
         self._make_layers(self.ngf, self.max_nc, norm_layer, nonlinearity, use_spectral_norm)
 
     def _make_layers(self,ngf,max_nc,norm_layer,nonlinearity, use_spectral_norm):
-        inc =self.structure_nc * 2
+        inc =self.inc
         # self.block0 = ResBlockEncoder(inc, ngf, ngf, norm_layer, nonlinearity, use_spectral_norm)
         self.block0 = EncoderBlock(inc, ngf, norm_layer, nonlinearity, use_spectral_norm)
         mult = 1
@@ -164,9 +262,8 @@ class PoseAttnFCNGenerator(nn.Module):
         '''
         pass
 
-    def forward(self, pose_A, pose_B):
+    def forward(self, x_in):
 
-        x_in = torch.cat((pose_A, pose_B), dim=1) # (42, 256, 256)
         attns=[]
 
         out = self.block0(x_in)
@@ -313,18 +410,266 @@ class AppearanceDecoder(nn.Module):
         out_image = self.outconv(out)
         return out_image
 
+class PoseSOAdaINDecoder(nn.Module):
+    '''
+    Pose Self occlusion decoder
+    '''
+    def __init__(self, structure_nc=21, n_decode_layers=3,n_bottle_neck_layers=3,output_nc=3, flow_layers=[2,3], ngf=64, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True,use_self_attention=False, align_corners=True, use_resample=False):
+        super(PoseSODecoder, self).__init__()
+        self.n_decode_layers = n_decode_layers
+        self.n_bottle_neck_layers = n_bottle_neck_layers
+        self.flow_layers = flow_layers
+        self.norm_type = norm_type
+        self.align_corners = align_corners
+        self.use_resample = use_resample
+        self.use_self_attention = use_self_attention
+        self.structure_nc = structure_nc
+        self.max_nc = max_nc
+        self.P_LEN = 2*max_nc*2*self.n_bottle_neck_layers 
+        self.p = nn.Parameter(torch.rand(self.P_LEN,512).normal_(0.0,0.02))
+
+        norm_layer = get_norm_layer(norm_type=norm_type)
+        nonlinearity = get_nonlinearity_layer(activation_type=activation)
+
+        self._make_layers(ngf, max_nc, output_nc, norm_layer, nonlinearity, use_spectral_norm)
+
+    def _make_layers(self, ngf, max_nc,output_nc, norm_layer, nonlinearity, use_spectral_norm):
+        ''' Encoder 
+        '''
+        # self.block0 = ResBlockEncoder(self.structure_nc, ngf, ngf, norm_layer, nonlinearity, use_spectral_norm)
+        self.block0 = EncoderBlock(self.structure_nc, ngf, norm_layer, nonlinearity, use_spectral_norm)
+        mult = 1
+        for i in range(1, self.n_decode_layers):
+            mult_prev = mult
+            mult = min(2 ** i, max_nc//ngf)
+            # block = ResBlockEncoder(ngf*mult_prev, ngf*mult,ngf*mult, norm_layer,
+            #                      nonlinearity, use_spectral_norm)
+            block = EncoderBlock(ngf*mult_prev, ngf*mult, norm_layer,
+                                 nonlinearity, use_spectral_norm)
+            setattr(self, 'encoder' + str(i), block)   
+
+        bottle_neck_nc = ngf*mult
+        for i in range(self.n_bottle_neck_layers):
+            block = ResBlock(bottle_neck_nc)
+            setattr(self, 'btneck' + str(i), block)   
+
+        '''Decoder:
+        layer1 : (256,32,32) w (2,32,32) -> (256,32,32) + (256,32,32) -> (128,64,64)
+        layer2 : (128,64,64) w (2,64,64) -> (128,64,64) + (128,64,64) -> (64,128,128)
+        layer3 : (64,128,128) -> (64,256,256)
+        conv  : (64,256,256) -> (3,256,256)
+        '''
+        mult = min(2 ** (self.n_decode_layers-1), max_nc//ngf)
+        for i in range(self.n_decode_layers):
+            mult_prev = mult
+            mult = min(2 ** (self.n_decode_layers-i-2), max_nc//ngf) if i != self.n_decode_layers-1 else 1
+            # if self.n_decode_layers-i in self.flow_layers: # [2,3]
+            #     mult_prev = mult_prev*2
+            if self.n_decode_layers - i in self.flow_layers:
+                direct_attn = nn.Conv2d(ngf*mult_prev, 1, kernel_size=3,stride=1,padding=1,bias=True)
+                setattr(self, 'so'+str(i), direct_attn )
+            up = nn.Sequential(
+                ResBlock2d(ngf*mult_prev,3,1,self.norm_type, use_spectral_norm),
+                # ResBlockDecoder(ngf*mult_prev, ngf*mult, norm_layer=norm_layer, nonlinearity=nonlinearity, use_spect=use_spectral_norm)
+                ResBlockUpNorm(ngf*mult_prev, ngf*mult, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+            )
+            setattr(self, 'decoder'+str(i), up)
+            
+                
+            if self.use_self_attention:
+                if self.n_decode_layers-i == self.flow_layers[1]:
+                    selfattn = SelfAttention(ngf*mult)
+                    setattr(self, 'sa'+str(i), selfattn)
+
+        
+        self.outconv = Output(ngf, output_nc, 3, None, nonlinearity, use_spectral_norm, False)
+        if self.use_resample:
+            self.resample = Resample2d(4, 1, sigma=2)
+
+
+    # get 3 channel image
+    # source_features is reversed 
+    # flows: K * [2,32,32][2,64,64]
+    # attns: K * [1,32,32][1,64,64]
+    # source_features: K * [256,32,32][128,64,64]
+    # e: B, max_nc, 1
+    def forward(self, g_y, source_features, flows, attns, e):
+        p = self.p.unsqueeze(0)
+        p = p.expand(e.shape[0],self.P_LEN,self.max_nc) #B, p_len, max_nc
+        e_psi = torch.bmm(p, e) #B, p_len, 1
+
+        out = self.block0(g_y)
+        for i in range(1, self.n_decode_layers):
+            model = getattr(self, 'encoder'+str(i))
+            out = model(out)
+        
+        # finally got [256,32,32] output
+        for i in range(self.n_bottle_neck_layers):
+            model = getattr(self, 'btneck'+str(i))
+            out = model(out, e_psi[:,i*max_nc*4:(i+1)*max_nc*4,:])
+
+        counter = 0
+        K = len(source_features)
+        normed_attns = []
+        pose_out = []
+        for i in range(self.n_decode_layers):
+            model = getattr(self, 'decoder' + str(i))
+
+            if self.n_decode_layers-i in self.flow_layers:
+                direct_attn = getattr(self, 'so'+str(i))
+                attn_p = direct_attn(out) # attention of direct generated part
+                all_attns = attn_p
+                for k in range(K):
+                    all_attns = torch.cat((all_attns,attns[k][counter]),dim=1)
+                all_attns = nn.Softmax(dim=1)(all_attns)
+
+                merge = all_attns[:,0:1,...] * out
+                for k in range(K):
+                    if self.use_resample:
+                        out_k = self.resample(source_features[k][i], flows[k][counter])
+                    else:
+                        out_k = warp_flow(source_features[k][i], flows[k][counter], align_corners=self.align_corners)
+                    merge += out_k * all_attns[:,k+1:k+2,...]
+                counter += 1
+                out = merge # warp + direct feature
+                normed_attns += [all_attns]
+                pose_out += [all_attns[:,0:1,...] * out]
+            out = model(out)
+            if self.use_self_attention:
+                if self.n_decode_layers-i == self.flow_layers[1]:
+                    model = getattr(self, 'sa'+str(i),)
+                    out = model(out)
+        out_image = self.outconv(out)
+        return out_image, normed_attns, pose_out
+
+
+class PoseSODecoder(nn.Module):
+    '''
+    Pose Self occlusion decoder
+    '''
+    def __init__(self, structure_nc=21, n_decode_layers=3,output_nc=3, flow_layers=[2,3], ngf=64, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True,use_self_attention=False, align_corners=True, use_resample=False):
+        super(PoseSODecoder, self).__init__()
+        self.n_decode_layers = n_decode_layers
+        self.flow_layers = flow_layers
+        self.norm_type = norm_type
+        self.align_corners = align_corners
+        self.use_resample = use_resample
+        self.use_self_attention = use_self_attention
+        self.structure_nc = structure_nc
+
+        norm_layer = get_norm_layer(norm_type=norm_type)
+        nonlinearity = get_nonlinearity_layer(activation_type=activation)
+
+        self._make_layers(ngf, max_nc, output_nc, norm_layer, nonlinearity, use_spectral_norm)
+
+    def _make_layers(self, ngf, max_nc,output_nc, norm_layer, nonlinearity, use_spectral_norm):
+        ''' Encoder 
+        '''
+        # self.block0 = ResBlockEncoder(self.structure_nc, ngf, ngf, norm_layer, nonlinearity, use_spectral_norm)
+        self.block0 = EncoderBlock(self.structure_nc, ngf, norm_layer, nonlinearity, use_spectral_norm)
+        mult = 1
+        for i in range(1, self.n_decode_layers):
+            mult_prev = mult
+            mult = min(2 ** i, max_nc//ngf)
+            # block = ResBlockEncoder(ngf*mult_prev, ngf*mult,ngf*mult, norm_layer,
+            #                      nonlinearity, use_spectral_norm)
+            block = EncoderBlock(ngf*mult_prev, ngf*mult, norm_layer,
+                                 nonlinearity, use_spectral_norm)
+            setattr(self, 'encoder' + str(i), block)         
+        '''Decoder:
+        layer1 : (256,32,32) w (2,32,32) -> (256,32,32) + (256,32,32) -> (128,64,64)
+        layer2 : (128,64,64) w (2,64,64) -> (128,64,64) + (128,64,64) -> (64,128,128)
+        layer3 : (64,128,128) -> (64,256,256)
+        conv  : (64,256,256) -> (3,256,256)
+        '''
+        mult = min(2 ** (self.n_decode_layers-1), max_nc//ngf)
+        for i in range(self.n_decode_layers):
+            mult_prev = mult
+            mult = min(2 ** (self.n_decode_layers-i-2), max_nc//ngf) if i != self.n_decode_layers-1 else 1
+            # if self.n_decode_layers-i in self.flow_layers: # [2,3]
+            #     mult_prev = mult_prev*2
+            if self.n_decode_layers - i in self.flow_layers:
+                direct_attn = nn.Conv2d(ngf*mult_prev, 1, kernel_size=3,stride=1,padding=1,bias=True)
+                setattr(self, 'so'+str(i), direct_attn )
+            up = nn.Sequential(
+                ResBlock2d(ngf*mult_prev,3,1,self.norm_type, use_spectral_norm),
+                # ResBlockDecoder(ngf*mult_prev, ngf*mult, norm_layer=norm_layer, nonlinearity=nonlinearity, use_spect=use_spectral_norm)
+                ResBlockUpNorm(ngf*mult_prev, ngf*mult, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+            )
+            setattr(self, 'decoder'+str(i), up)
+            
+                
+            if self.use_self_attention:
+                if self.n_decode_layers-i == self.flow_layers[1]:
+                    selfattn = SelfAttention(ngf*mult)
+                    setattr(self, 'sa'+str(i), selfattn)
+
+        
+        self.outconv = Output(ngf, output_nc, 3, None, nonlinearity, use_spectral_norm, False)
+        if self.use_resample:
+            self.resample = Resample2d(4, 1, sigma=2)
+
+
+    # get 3 channel image
+    # source_features is reversed 
+    # flows: K * [2,32,32][2,64,64]
+    # attns: K * [1,32,32][1,64,64]
+    # source_features: K * [256,32,32][128,64,64]
+    def forward(self, g_y, source_features, flows, attns):
+        out = self.block0(g_y)
+        for i in range(1, self.n_decode_layers):
+            model = getattr(self, 'encoder'+str(i))
+            out = model(out)
+        
+        # finally got [256,32,32] output
+
+        counter = 0
+        K = len(source_features)
+        normed_attns = []
+        pose_out = []
+        for i in range(self.n_decode_layers):
+            model = getattr(self, 'decoder' + str(i))
+
+            if self.n_decode_layers-i in self.flow_layers:
+                direct_attn = getattr(self, 'so'+str(i))
+                attn_p = direct_attn(out) # attention of direct generated part
+                all_attns = attn_p
+                for k in range(K):
+                    all_attns = torch.cat((all_attns,attns[k][counter]),dim=1)
+                all_attns = nn.Softmax(dim=1)(all_attns)
+
+                merge = all_attns[:,0:1,...] * out
+                for k in range(K):
+                    if self.use_resample:
+                        out_k = self.resample(source_features[k][i], flows[k][counter])
+                    else:
+                        out_k = warp_flow(source_features[k][i], flows[k][counter], align_corners=self.align_corners)
+                    merge += out_k * all_attns[:,k+1:k+2,...]
+                counter += 1
+                out = merge # warp + direct feature
+                normed_attns += [all_attns]
+                pose_out += [all_attns[:,0:1,...] * out]
+            out = model(out)
+            if self.use_self_attention:
+                if self.n_decode_layers-i == self.flow_layers[1]:
+                    model = getattr(self, 'sa'+str(i),)
+                    out = model(out)
+        out_image = self.outconv(out)
+        return out_image, normed_attns, pose_out
+
 
 class PoseAwareAppearanceDecoder(nn.Module):
     '''
     Pose Stream Decoder
     '''
-    def __init__(self, structure_nc=21, n_decode_layers=3,output_nc=3, flow_layers=[2,3], ngf=64, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True, align_corners=True, use_resample=False):
+    def __init__(self, structure_nc=21, n_decode_layers=3,output_nc=3, flow_layers=[2,3], ngf=64, max_nc=256, norm_type='bn',activation='LeakyReLU', use_spectral_norm=True,use_self_attention=False, align_corners=True, use_resample=False):
         super(PoseAwareAppearanceDecoder, self).__init__()
         self.n_decode_layers = n_decode_layers
         self.flow_layers = flow_layers
         self.norm_type = norm_type
         self.align_corners = align_corners
         self.use_resample = use_resample
+        self.use_self_attention = use_self_attention
         self.structure_nc = structure_nc
 
         norm_layer = get_norm_layer(norm_type=norm_type)
@@ -364,9 +709,10 @@ class PoseAwareAppearanceDecoder(nn.Module):
                 # ResBlockUpNorm(ngf*mult_prev, ngf*mult, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
             )
             setattr(self, 'decoder'+str(i), up)
-            if self.n_decode_layers-i in self.flow_layers:
-                selfattn = SelfAttention(ngf*mult)
-                setattr(self, 'sa'+str(i), selfattn)
+            if self.use_self_attention:
+                if self.n_decode_layers-i == self.flow_layers[1]:
+                    selfattn = SelfAttention(ngf*mult)
+                    setattr(self, 'sa'+str(i), selfattn)
 
         
         self.outconv = Output(ngf, output_nc, 3, None, nonlinearity, use_spectral_norm, False)
@@ -412,11 +758,13 @@ class PoseAwareAppearanceDecoder(nn.Module):
                     else:
                         merge += out_k
                 counter += 1
-                out = merge
-                sa_layer = getattr(self, 'sa'+str(i))
-                out = sa_layer(out)
-            
+                out = merge # warp + direct feature
+                
             out = model(out)
+            if self.use_self_attention:
+                if self.n_decode_layers-i == self.flow_layers[1]:
+                    model = getattr(self, 'sa'+str(i),)
+                    out = model(out)
         out_image = self.outconv(out)
         return out_image
 

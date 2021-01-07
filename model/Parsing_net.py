@@ -77,104 +77,69 @@ class ParsingGenerator(nn.Module):
             return output_logits
 
 
-# class AppearanceEncoder(nn.Module):
-#     '''
-#     appearance encoder
-#     '''
-#     def __init__(self, n_layers=3, inc=3, use_spectral_norm=True):
-#         super(AppearanceEncoder, self).__init__()
-#         self.n_layers = n_layers
-#         self.inc = inc
-#         self.max_nc = 256
-#         self.down = self._make_layers(self.max_nc, use_spectral_norm)
+class MaskGenerator(nn.Module):
+    '''doc
+    '''
+    def __init__(self, inc=3+1+21,onc=1, ngf=64, n_layers=6,max_nc=512, norm_type='bn', activation='LeakyReLU', use_spectral_norm=False):
+        super(MaskGenerator, self).__init__()
 
-#     def _make_layers(self, max_nc, use_spectral_norm):
-#         '''
-#         Encoder:
-#         layer1 : (3,256,256) -> (64,128,128)
-#         layer2 : (64,128,128) -> (128,64,64)
-#         layer3 : (128,64,64) -> (256,32,32)
+        norm_layer = get_norm_layer(norm_type=norm_type)
+        nonlinearity = get_nonlinearity_layer(activation_type=activation)
+        self.inc = inc
+        self.onc = onc
+        self.ngf = ngf
+        self.norm_type = norm_type
+
+        self.max_nc = max_nc
+        self.encoder_layers = n_layers
+        self.decoder_layers = n_layers
+
+        self._make_layers(self.ngf, self.max_nc, norm_layer, nonlinearity, use_spectral_norm)
+
+    def _make_layers(self, ngf, max_nc, norm_layer, nonlinearity, use_spectral_norm):
+        inc = self.inc
+        onc = self.onc
+        self.encoder_block0 = ResBlockEncoder(inc, ngf, ngf, norm_layer, nonlinearity, use_spectral_norm)
+        mult = 1
+        for i in range(1, self.encoder_layers):
+            mult_prev = mult
+            mult = min(2 ** i, max_nc//ngf)
+            block = ResBlockEncoder(ngf*mult_prev, ngf*mult, ngf*mult, norm_layer, nonlinearity, use_spectral_norm)    
+            setattr(self, 'encoder' + str(i), block)
         
-#         Decoder
-#         layer1 : (256,32,32) -> (128,64,64)
-#         layer2 : (128,64,64) -> (64,128,128)
-#         layer3 : (64,128,128) -> (32,256,256)
+        mult_prev = mult
+        mult = min(2 ** (self.decoder_layers-2), max_nc//ngf)
+        self.decoder_block0 = ResBlockUpNorm(ngf*mult_prev, ngf*mult,norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
 
-#         layer4 : BN, ReLU
-#         layer5 :        
+        for i in range(1, self.decoder_layers-1):
+            mult_prev = mult * 2
+            mult = min(2 ** (self.decoder_layers-i-2), max_nc//ngf)
+            block = ResBlockUpNorm(ngf*mult_prev, ngf*mult, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+            setattr(self, 'decoder' + str(i), block)
         
-#         '''
-#         onc = 64
-#         layers = [ResBlockDown(self.inc, onc, use_spectral_norm=use_spectral_norm)]
-#         for i in range(1, int(self.n_layers)):
-#             if onc * 2 > max_nc:
-#                 layers.append(ResBlockDown(onc, onc, use_spectral_norm=use_spectral_norm))
-#             else:
-#                 layers.append(ResBlockDown(onc, onc * 2, use_spectral_norm=use_spectral_norm))
-#             onc = onc * 2
-
-#         return nn.Sequential(*layers)
-    
-#     def forward(self, x):
-#         return self.down(x)
+        mult_prev = mult * 2
+        self.decoder_out = ResBlockUpNorm(ngf*mult_prev, onc, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
         
-# class AppearanceDecoder(nn.Module):
-#     '''
-#     Decode part of the generator
-#     '''
-#     def __init__(self, n_bottleneck_layers=4, n_decode_layers=3, norm_type='bn', use_spectral_norm=True):
-#         super(AppearanceDecoder, self).__init__()
-#         self.n_bottleneck_layers = n_bottleneck_layers
-#         self.n_decode_layers = n_decode_layers
-#         self.bottleneck_nc = 64 * 2**(n_decode_layers-1)
 
-
-#         self.decoder_onc = 32
-#         self.norm_layer = make_norm_layer(norm_type, self.decoder_onc)
-#         self.relu = nn.LeakyReLU(inplace = False)
-#         self.conv2d = nn.Sequential(
-#             nn.ReflectionPad2d(1),
-#             nn.Conv2d(self.decoder_onc, 3, 3, padding = 0)
-#         )
-#         self.sigmoid = nn.Sigmoid()
-
+    def forward(self, image1, mask1, pose2):
+        _,_,H,W = image1.shape
+        x_in = torch.cat((image1, mask1, pose2), dim=1) # (43, 256, 256)
+        out = self.encoder_block0(x_in)
+        result = [out]
+        for i in range(1, self.encoder_layers):
+            model = getattr(self, 'encoder' + str(i))
+            out = model(out)
+            result.append(out) 
         
-#         self.bottleneck = self._make_bottle_neck_layers(norm_type,use_spectral_norm)
-#         self.decoder = self._make_decoder_layers(norm_type,use_spectral_norm)
-
-#     def _make_bottle_neck_layers(self, norm_type, use_spectral_norm):
-#         layers = []
-#         for i in range(self.n_bottleneck_layers):
-#             layers.append(ResBlock2d(self.bottleneck_nc, 3, 1, norm_type=norm_type, use_spectral_norm=use_spectral_norm))
+        out = self.decoder_block0(out)
+        for i in range(1, self.decoder_layers-1):
+            skip = result[self.encoder_layers-i-1]
+            model = getattr(self, 'decoder'+str(i))
+            out = model(torch.cat((out,skip),dim=1))
         
-#         return nn.Sequential(*layers)
-
-#     def _make_decoder_layers(self, norm_type,use_spectral_norm):
-#         layers = []
-#         for i in range(self.n_decode_layers ):
-#             # layers.append(ConvUp(self.bottleneck_nc//(2**i), self.bottleneck_nc//(2**i*2), norm_type=norm_type, use_spectral_norm=use_spectral_norm))
-#             layers.append(ResBlockUpNorm(self.bottleneck_nc//(2**i), self.bottleneck_nc//(2**i*2), norm_type=norm_type, use_spectral_norm=use_spectral_norm))
-            
-#             # if i == self.n_decode_layers -1:
-#             #     layers.append(ResBlockUpNorm(self.bottleneck_nc//(2**i), 3, norm_type=norm_type, use_spectral_norm=use_spectral_norm))
-#             # else:
-#             #     layers.append(ResBlockUpNorm(self.bottleneck_nc//(2**i), self.bottleneck_nc//(2**i*2), norm_type=norm_type, use_spectral_norm=use_spectral_norm))
-        
-#         layers.append(self.norm_layer) 
-#         layers.append(self.relu) 
-#         layers.append(self.conv2d)        
-#         layers.append(self.sigmoid)
-
-#         return nn.Sequential(*layers)
-        
-#     def forward(self, feature):
-#         return self.decoder(self.bottleneck(feature))
-#         # return self.decoder(feature)
-
-
-
-
-
+        skip = result[0]
+        output_logits = self.decoder_out(torch.cat((out,skip),dim=1))
+        return output_logits
 
 
 

@@ -6,7 +6,8 @@ import cv2
 from PIL import Image
 from PIL import ImageFont
 from PIL import ImageDraw
-
+import torch
+import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -42,6 +43,7 @@ def get_parser():
     '''Dataset options'''
     parser.add_argument('--use_clean_pose', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--use_parsing', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--use_input_mask', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--categories', type=int, default=9)
     parser.add_argument('--use_simmap', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--joints_for_cos_sim', type=int, default=-1)
@@ -90,6 +92,11 @@ def get_parser():
     parser.add_argument('--lambda_flow_attn', type=float, default=1, help='regular sample loss weight')
     
     # roi warp weights
+    parser.add_argument('--use_tps_sim', action='store_true', help='use precomputed tps sim')
+    parser.add_argument('--use_label', action='store_true', help='use precomputed tps sim')
+    parser.add_argument('--tps_sim_beta1', type=float, default=2.0, help='use precomputed tps sim')
+    parser.add_argument('--tps_sim_beta2', type=float, default=40.0, help='use precomputed tps sim')
+
     parser.add_argument('--use_mask_tv',action='store_true', help='use masked total variation flow loss')
     parser.add_argument('--lambda_flow_reg', type=float, default=200, help='regular sample loss weight')
     parser.add_argument('--lambda_struct', type=float, default=10, help='regular sample loss weight')
@@ -103,15 +110,21 @@ def get_parser():
 if __name__ == '__main__':
     opt = get_parser()
     opt.K = 2
-    path_to_dataset = '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion'
+    opt.gpu = 3
+    opt.use_tps_sim = True
+    opt.use_label =False
+    opt.use_input_mask = True
+    path_to_dataset = '/dataset/ljw/deepfashion/GLFA_split/fashion'
     train_tuples_name = 'fasion-pairs-train.csv' if opt.K==1 else 'fasion-%d_tuples-train.csv'%(opt.K+1)
     test_tuples_name = 'fasion-pairs-test.csv' if opt.K==1 else 'fasion-%d_tuples-test.csv'%(opt.K+1)
-    if opt.use_parsing:
-        path_to_train_parsing = os.path.join(path_to_dataset, 'train_parsing_merge/')
-        path_to_test_parsing = os.path.join(path_to_dataset, 'test_parsing_merge/')
-    else:
-        path_to_train_parsing = None
-        path_to_test_parsing = None
+    
+    path_to_train_parsing = os.path.join(path_to_dataset, 'train_parsing_merge/')
+    path_to_test_parsing = os.path.join(path_to_dataset, 'test_parsing_merge/')
+    
+    path_to_train_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_sim'
+    path_to_test_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_sim' 
+    path_to_train_sim = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_sim'
+    path_to_test_sim = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_sim' 
     dataset = FashionDataset(
             phase = 'train',
             path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
@@ -120,11 +133,15 @@ if __name__ == '__main__':
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
+            path_to_train_sim_dir=path_to_train_sim,
+            path_to_test_sim_dir=path_to_test_sim,
             path_to_train_parsings_dir=path_to_train_parsing, 
             path_to_test_parsings_dir=path_to_test_parsing, 
             opt=opt)
 
-    save_dir = './test_sim_result/all_bones_normed/'
+    save_dir = os.path.join(path_to_dataset,'test_sim_result/all_bones_normed/')
     # save_dir = './test_sim_result/4_bones_sho_hip_normed/'
     # save_dir = './test_sim_result/4_bones_sho_hip/'
     # save_dir = './test_sim_result/2_bones_sho/'
@@ -136,33 +153,52 @@ if __name__ == '__main__':
         out_size = (256,256)
         ref_xs = batch_data['ref_xs']
         ref_ys = batch_data['ref_ys']
-        sims = batch_data['cos_sim']
+        sims = batch_data['sim']
         g_x = batch_data['g_x']
         g_y = batch_data['g_y']
+        g_m = batch_data['g_m']
         froms = batch_data['froms']
         to = batch_data['to']
         
+        softmax_scaling = 2
+        sim_normed = torch.cat(sims,dim=0)
+        sim_normed = nn.Softmax(dim=0)(sim_normed * softmax_scaling) * g_m
+
         visual_g_x = tensor2im(g_x.unsqueeze(0), out_size=out_size).type(torch.uint8).numpy()
         visual_g_y = tensor2im(g_y.unsqueeze(0), out_size=out_size).type(torch.uint8).numpy()
         visual_refy1 = tensor2im(ref_ys[0].unsqueeze(0), out_size=out_size).type(torch.uint8).numpy()
         visual_refy2 = tensor2im(ref_ys[1].unsqueeze(0), out_size=out_size).type(torch.uint8).numpy()
+        
         visual_refx1 = tensor2im(ref_xs[0].unsqueeze(0), out_size=out_size).type(torch.uint8).numpy()
         visual_refx2 = tensor2im(ref_xs[1].unsqueeze(0), out_size=out_size).type(torch.uint8).numpy()
+
+        visual_sim1 = tensor2im(sim_normed[0].unsqueeze(0).unsqueeze(0), out_size=out_size, is_mask=True).type(torch.uint8).cpu().numpy()
+        visual_sim2 = tensor2im(sim_normed[1].unsqueeze(0).unsqueeze(0), out_size=out_size, is_mask=True).type(torch.uint8).cpu().numpy()
         
+        alpha = 0.3
+        visual_sim1_overlay = visual_g_x * alpha + visual_sim1 * (1-alpha)
+        visual_sim2_overlay = visual_g_x * alpha + visual_sim2 * (1-alpha)
+        visual_sim1_overlay = visual_sim1_overlay.astype(np.uint8)
+        visual_sim2_overlay = visual_sim2_overlay.astype(np.uint8)
+        white = np.zeros(visual_sim2_overlay.shape).astype(np.uint8)
+        
+
         texted_refy1 = Image.fromarray(visual_refy1.astype(np.uint8))
         texted_refy2 = Image.fromarray(visual_refy2.astype(np.uint8))
         
         # texted_refy1 = cv2.putText(img=np.array(visual_refy1), text=sims[0].numpy(), org=(200,200),fontFace=3, fontScale=3, color=(255,255,255), thickness=5)
         # texted_refy2 = cv2.putText(img=np.array(visual_refy2), text=sims[1].numpy(), org=(200,200),fontFace=3, fontScale=3, color=(255,255,255), thickness=5)
-        draw1 = ImageDraw.Draw(texted_refy1)
-        draw2 = ImageDraw.Draw(texted_refy2)
+        # draw1 = ImageDraw.Draw(texted_refy1)
+        # draw2 = ImageDraw.Draw(texted_refy2)
         # font = ImageFont.truetype(<font-file>, <font-size>)
         # draw.text((x, y),"Sample Text",(r,g,b))
-        draw1.text((0, 0),str(sims[0].numpy()),(255,255,255))
-        draw2.text((0, 0),str(sims[1].numpy()),(255,255,255))
+        # draw1.text((0, 0),str(sims[0].numpy()),(255,255,255))
+        # draw2.text((0, 0),str(sims[1].numpy()),(255,255,255))
         
         imgs = np.concatenate((visual_refx1, visual_refx2, visual_g_x),axis=1)
         ys = np.concatenate((np.asarray(texted_refy1), np.asarray(texted_refy2), visual_g_y), axis=1)
-        final = np.concatenate((imgs,ys),axis=0)
+        vsims = np.concatenate((visual_sim1,visual_sim2, visual_sim2),axis=1)
+        vsims_overlay = np.concatenate((visual_sim1_overlay,visual_sim2_overlay, white),axis=1)
+        final = np.concatenate((imgs,ys,vsims,vsims_overlay),axis=0)
         final = Image.fromarray(final)
         final.save(save_dir+'{}.jpg'.format(i))

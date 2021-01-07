@@ -771,7 +771,6 @@ def train_flow_net_with_occ(opt, exp_name):
     i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
     optimizerG.load_state_dict(checkpoint['optimizerG'])
     _freeze(GE)
-    _freeze(GD)
     GE = VGG19().to(device)
     '''create tensorboard writter'''
     writer = create_writer(path_to_log_dir)
@@ -782,14 +781,9 @@ def train_flow_net_with_occ(opt, exp_name):
     criterionCorrectness = PerceptualCorrectness().to(device)
     criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
 
-    save_freq = 1
 
     """ Training start """
     for epoch in range(epochCurrent, opt.epochs):
-        if epoch >= 100:
-            save_freq=5
-        if epoch >= 500:
-            save_freq=10
         if epoch > epochCurrent:
             i_batch_current = 0
         epoch_loss_G = 0

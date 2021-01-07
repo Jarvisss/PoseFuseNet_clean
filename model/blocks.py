@@ -86,7 +86,7 @@ def warp_flow(source, flow, align_corners=True, mode='bilinear', mask=None, mask
     Warp a image x according to the given flow
     Input:
         x: (b, c, H, W)
-        flow: (b, 2, H, W) # range [w-1, h-1]
+        flow: (b, 2, H, W) # range [-w/2, w/2] [-h/2, h/2]
         mask: (b, 1, H, W)
     Ouput:
         y: (b, c, H, W)
@@ -430,41 +430,41 @@ class ResBlockDecoder(nn.Module):
         out = self.model(x) + self.shortcut(x)
         return out
 
-class ResBlock(nn.Module):
-    """
-    Define an Residual block for different types
-    """
-    def __init__(self, input_nc, output_nc=None, hidden_nc=None, norm_layer=nn.BatchNorm2d, nonlinearity= nn.LeakyReLU(),
-                learnable_shortcut=False, use_spect=False, use_coord=False):
-        super(ResBlock, self).__init__()
+# class ResBlock(nn.Module):
+#     """
+#     Define an Residual block for different types
+#     """
+#     def __init__(self, input_nc, output_nc=None, hidden_nc=None, norm_layer=nn.BatchNorm2d, nonlinearity= nn.LeakyReLU(),
+#                 learnable_shortcut=False, use_spect=False, use_coord=False):
+#         super(ResBlock, self).__init__()
 
-        hidden_nc = input_nc if hidden_nc is None else hidden_nc
-        output_nc = input_nc if output_nc is None else output_nc
-        self.learnable_shortcut = True if input_nc != output_nc else learnable_shortcut
+#         hidden_nc = input_nc if hidden_nc is None else hidden_nc
+#         output_nc = input_nc if output_nc is None else output_nc
+#         self.learnable_shortcut = True if input_nc != output_nc else learnable_shortcut
 
-        kwargs = {'kernel_size': 3, 'stride': 1, 'padding': 1}
-        kwargs_short = {'kernel_size': 1, 'stride': 1, 'padding': 0}
+#         kwargs = {'kernel_size': 3, 'stride': 1, 'padding': 1}
+#         kwargs_short = {'kernel_size': 1, 'stride': 1, 'padding': 0}
 
-        conv1 = coord_conv(input_nc, hidden_nc, use_spect, use_coord, **kwargs)
-        conv2 = coord_conv(hidden_nc, output_nc, use_spect, use_coord, **kwargs)
+#         conv1 = coord_conv(input_nc, hidden_nc, use_spect, use_coord, **kwargs)
+#         conv2 = coord_conv(hidden_nc, output_nc, use_spect, use_coord, **kwargs)
 
-        if type(norm_layer) == type(None):
-            self.model = nn.Sequential(nonlinearity, conv1, nonlinearity, conv2,)
-        else:
-            self.model = nn.Sequential(norm_layer(input_nc), nonlinearity, conv1, 
-                                       norm_layer(hidden_nc), nonlinearity, conv2,)
+#         if type(norm_layer) == type(None):
+#             self.model = nn.Sequential(nonlinearity, conv1, nonlinearity, conv2,)
+#         else:
+#             self.model = nn.Sequential(norm_layer(input_nc), nonlinearity, conv1, 
+#                                        norm_layer(hidden_nc), nonlinearity, conv2,)
 
-        if self.learnable_shortcut:
-            bypass = coord_conv(input_nc, output_nc, use_spect, use_coord, **kwargs_short)
-            self.shortcut = nn.Sequential(bypass,)
+#         if self.learnable_shortcut:
+#             bypass = coord_conv(input_nc, output_nc, use_spect, use_coord, **kwargs_short)
+#             self.shortcut = nn.Sequential(bypass,)
 
 
-    def forward(self, x):
-        if self.learnable_shortcut:
-            out = self.model(x) + self.shortcut(x)
-        else:
-            out = self.model(x) + x
-        return out
+#     def forward(self, x):
+#         if self.learnable_shortcut:
+#             out = self.model(x) + self.shortcut(x)
+#         else:
+#             out = self.model(x) + x
+#         return out
 
 class ResBlockDownFirst(nn.Module):
     def __init__(self, in_channel, out_channel, conv_size=3, padding_size=1):
@@ -580,35 +580,65 @@ def adaIN(feature, mean_style, std_style, eps = 1e-5):
     adain = adain.view(B,C,H,W)
     return adain
 
+class Embedder(nn.Module):
+    def __init__(self, in_height, structure_nc=21, max_nc=256):
+        super(Embedder, self).__init__()
+        
+        self.relu = nn.LeakyReLU(inplace=False)
+        
+        #in 6*224*224
+        self.resDown1 = ResBlockDown(structure_nc+3, 32) #out 32*128*128
+        self.resDown2 = ResBlockDown(32, 64) #out 64*64*64
+        self.resDown3 = ResBlockDown(64, 128) #out 128*32*32
+        self.self_att = SelfAttention(128) #out 128*32*32
+        self.resDown4 = ResBlockDown(128, 256) #out 256*16*16
+        self.resDown5 = ResBlockDown(256, 256) #out 256*8*8
+        self.sum_pooling = nn.AdaptiveMaxPool2d((1,1)) #out 256*1*1
 
-# class ResBlock(nn.Module):
-#     def __init__(self, in_channel):
-#         super(ResBlock, self).__init__()
+    def forward(self, x, y):
+        out = torch.cat((x,y),dim = 1) #out 24*224*224
+        out = self.resDown1(out) #out 32*128*128
+        out = self.resDown2(out) #out 64*64*64
+        out = self.resDown3(out) #out 256*32*32
         
-#         #using no ReLU method
+        out = self.self_att(out) #out 256*32*32
         
-#         #general
-#         self.relu = nn.LeakyReLU(inplace = False)
+        out = self.resDown4(out) #out 256*16*16
+        out = self.resDown5(out) #out 256*8*8
         
-#         #left
-#         self.conv1 = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 3, padding = 1))
-#         self.conv2 = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 3, padding = 1))
+        out = self.sum_pooling(out) #out 256*1*1
+        out = self.relu(out) #out 256*1*1
+        out = out.view(-1,max_nc,1) #out B*256*1
+        return out
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channel):
+        super(ResBlock, self).__init__()
         
-#     def forward(self, x, psi_slice):
-#         C = psi_slice.shape[1]
+        #using no ReLU method
         
-#         res = x
+        #general
+        self.relu = nn.LeakyReLU(inplace = False)
         
-#         out = adaIN(x, psi_slice[:, 0:C//4, :], psi_slice[:, C//4:C//2, :])
-#         out = self.relu(out)
-#         out = self.conv1(out)
-#         out = adaIN(out, psi_slice[:, C//2:3*C//4, :], psi_slice[:, 3*C//4:C, :])
-#         out = self.relu(out)
-#         out = self.conv2(out)
+        #left
+        self.conv1 = nn.Conv2d(in_channel, in_channel, 3, padding = 1)
+        self.conv2 = nn.Conv2d(in_channel, in_channel, 3, padding = 1)
         
-#         out = out + res
+    def forward(self, x, psi_slice):
+        C = psi_slice.shape[1]
         
-#         return out
+        res = x
+        
+        out = adaIN(x, psi_slice[:, 0:C//4, :], psi_slice[:, C//4:C//2, :])
+        out = self.relu(out)
+        out = self.conv1(out)
+        out = adaIN(out, psi_slice[:, C//2:3*C//4, :], psi_slice[:, 3*C//4:C, :])
+        out = self.relu(out)
+        out = self.conv2(out)
+        
+        out = out + res
+        
+        return out
         
 class ResBlockD(nn.Module):
     def __init__(self, in_channel):

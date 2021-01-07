@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.utils.data as data
+import torch.nn as nn
 import pandas as pd
 import cv2
 import torchvision.transforms.functional as F
@@ -36,16 +37,19 @@ class FashionDataset(data.Dataset):
     path_to_train_imgs_dir, path_to_train_anno, 
     path_to_test_imgs_dir, path_to_test_anno, opt,
     path_to_train_label_dir=None, path_to_test_label_dir=None,
+    path_to_train_sim_dir=None, path_to_test_sim_dir=None,
     path_to_train_parsings_dir=None,path_to_test_parsings_dir=None, 
     load_size=256, pose_scale=255.0):
         super(FashionDataset, self).__init__()
         
         self._is_train = phase == 'train'
+        self._is_eval = phase=='eval'
         self._train_tuples = pd.read_csv(path_to_train_tuples)
         self._train_anno = pd.read_csv(path_to_train_anno, sep=':')
         self._train_img_dir = path_to_train_imgs_dir
         self._train_parsing_dir = path_to_train_parsings_dir
         self._train_label_dir = path_to_train_label_dir
+        self._train_sim_dir = path_to_train_sim_dir
         print ("--------------- Dataset Info: ---------------")
         print ("Phase: %s" % phase)
         print ("Number of tuples train: %s" % len(self._train_tuples))
@@ -53,7 +57,9 @@ class FashionDataset(data.Dataset):
         self._test_tuples = pd.read_csv(path_to_test_tuples)
         self._test_anno = pd.read_csv(path_to_test_anno, sep=':')
         self._test_img_dir = path_to_test_imgs_dir
+        self._test_parsing_dir = path_to_test_parsings_dir
         self._test_label_dir = path_to_test_label_dir
+        self._test_sim_dir = path_to_test_sim_dir
         print ("Number of tuples test: %s" % len(self._test_tuples))
         # self._test_tuples = pd.read_csv(path_to_train_tuples)
         # self._test_anno = pd.read_csv(path_to_test_anno, sep=':')
@@ -67,10 +73,15 @@ class FashionDataset(data.Dataset):
         self._annotation_file = self._annotation_file.set_index('name')
         print ("Number of total images: %s" % len(self._annotation_file))
 
-        self.size = len(self._train_tuples) if self._is_train else len(self._test_tuples)
+        if self._is_train:
+            self.size = len(self._train_tuples)
+        elif self._is_eval:
+            self.size = len(self._test_tuples) // 10
+        else:
+            self.size = len(self._test_tuples)
+
 
         # self.use_dot = opt.use_dot
-        # self.align_input = opt.align_input
 
         self.name = 'fashion'
         self.load_size = (load_size, load_size)
@@ -85,16 +96,27 @@ class FashionDataset(data.Dataset):
         self.img_size = (0,0)
         self.pose_scale = pose_scale
         self.align_corner = opt.align_corner
-        self.use_parsing = opt.use_parsing
-        self.use_tps_sim = opt.use_tps_sim
-        self.tps_sim_beta1 = opt.tps_sim_beta1
-        self.tps_sim_beta2 = opt.tps_sim_beta2
-        self.affine_param = self.getRandomAffineParam()
+        self.use_parsing = opt.use_parsing if hasattr(opt, 'use_parsing') else False
+        self.use_mask = opt.use_input_mask if hasattr(opt, 'use_input_mask') else False
+        self.align_input = opt.align_input if hasattr(opt, 'align_input') else False
+        self.use_tps_sim = opt.use_tps_sim if hasattr(opt, 'use_tps_sim') else False
+        self.use_label_field_tps = opt.use_label_field_tps if hasattr(opt, 'use_label_field_tps') else False
+        self.tps_sim_beta1 = opt.tps_sim_beta1 if hasattr(opt, 'tps_sim_beta1') else 0
+        self.tps_sim_beta2 = opt.tps_sim_beta2 if hasattr(opt, 'tps_sim_beta2') else 0
+        # self.affine_param = self.getRandomAffineParam()
+        self.affine_param = self.getAffineParam(angle=10, scale=1.1, shift=(5,10))
 
         self.joints_for_cos_sim = opt.joints_for_cos_sim if hasattr(opt, 'joints_for_cos_sim') else 4
 
 
+    def getAffineParam(self, angle, scale, shift):
+        affine_param=dict()
+        affine_param['angle'] = angle
+        affine_param['scale'] = scale
+        affine_param['shift']=(shift[0], shift[1])
 
+        return affine_param
+        
     def getRandomAffineParam(self):
         if not self.angle and not self.scale and not self.shift:
             affine_param = None
@@ -176,6 +198,27 @@ class FashionDataset(data.Dataset):
         # label = torch.Tensor(label).permute(2,0,1)
         return label
 
+    def load_tps_sim(self, tuple_df, direction=''):
+        '''load precalculated sim from disk
+        shape : [1,176,256]
+        '''
+        assert direction in ['from_' + str(i) for i in range(self._nb_inputs)] + ['from']
+        target = tuple_df['to'].replace('.jpg','')
+        source = tuple_df[direction].replace('.jpg','')
+        if self._is_train: 
+            sim_path = os.path.join(self._train_sim_dir, source+'_2_'+target+'_sim.npy')
+        else:
+            sim_path = os.path.join(self._test_sim_dir, source+'_2_'+target+'_sim.npy')
+        
+        sim = np.load(sim_path)
+        sim[sim<0] = 0
+        sim[sim>1] = 1
+        sim = torch.Tensor(sim) 
+        sim = F.resize(sim, self.load_size, interpolation=Image.BILINEAR)
+        assert(sim.shape == (1,256,256))
+        # label = torch.Tensor(label).permute(2,0,1)
+        return sim
+
     def load_parsing(self, tuple_df, direction='' ,categories=8, affine=None):
         assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)] + ['from']
         if self._is_train: 
@@ -183,7 +226,7 @@ class FashionDataset(data.Dataset):
         else:
             parsing_path = os.path.join(self._test_parsing_dir, tuple_df[direction].replace('.jpg','_merge.png'))
         parsing_img = Image.open(parsing_path)
-        parsing_img = np.array(self.transform_image(parsing_img, self.load_size, affine=self.affine_param, fillWhiteColor=False, toTensor=False, normalize=False)) # 0-19 one channel map
+        parsing_img = np.array(self.transform_image(parsing_img, self.load_size, affine=affine, fillWhiteColor=False, toTensor=False, normalize=False)) # 0-19 one channel map
         # [H W 1 ] -> [H W 20]
         parsing_bin_map = np.stack((parsing_img,)*categories, axis=2)
         # print(parsing_bin_map.shape)
@@ -194,7 +237,19 @@ class FashionDataset(data.Dataset):
         # [H W 20] -> [20 H W]
         # [0-255] -> [0-1]
         parsing_bin_map = F.to_tensor(parsing_bin_map) 
+
         return parsing_bin_map
+    
+    def load_fg_mask(self, tuple_df, direction='', affine=None):
+        assert direction in ['to'] + ['from_' + str(i) for i in range(self._nb_inputs)] + ['from']
+        if self._is_train: 
+            parsing_path = os.path.join(self._train_parsing_dir, tuple_df[direction].replace('.jpg','_merge.png'))
+        else:
+            parsing_path = os.path.join(self._test_parsing_dir, tuple_df[direction].replace('.jpg','_merge.png'))
+        parsing_img = Image.open(parsing_path)
+        parsing_img = np.array(self.transform_image(parsing_img, self.load_size, affine=affine, fillWhiteColor=False, toTensor=False, normalize=False)) # 0-19 one channel map
+        fg = (1-(parsing_img == 0).astype(np.uint8)) * 255 
+        return F.to_tensor(fg)
 
     '''Calculate shoulder direction vector cosine similarity
     @ g_j: [2, 17] ndarray,  y,x order
@@ -297,10 +352,10 @@ class FashionDataset(data.Dataset):
 
     def get_tps_similarity(self, gt_y, ref_ys, gt_label, ref_labels):
         '''
-        gt_y: [2,18] tensor
-        ref_ys: K * [2,18] tensor
-        gt_label: [anno_size , 3] tensor
-        ref_labels: K * [anno_size , 3] tensor
+        gt_y: [2,18] ndarray
+        ref_ys: K * [2,18] ndarray
+        gt_label: [anno_size , 3] ndarray
+        ref_labels: K * [anno_size , 3] ndarray
 
         return: K*[1, load_size] tensor
         '''
@@ -309,17 +364,34 @@ class FashionDataset(data.Dataset):
         for i in range(len(ref_ys)):
             scale, trans = pose_utils.get_scale_trans(ref_ys[i][::-1,:],gt_y[::-1,:]) # y,x to x,y
             grid = self.get_warp_grid(scale, trans, self.anno_size)
+            ref_direction = pose_utils.getDirection(ref_ys[i])
+            g_direction = pose_utils.getDirection(gt_y)
+
+            if ref_direction < 0 :
+                ref_labels[i] = np.minimum(ref_labels[i], 0) # all control label < 0, tps value < 0
+            elif ref_direction > 0 :
+                ref_labels[i] = np.maximum(ref_labels[i], 0) # all control label > 0, tps value > 0
+            else:
+                print('ERROR!! direction = 0')
+            
+            if g_direction < 0 :
+                gt_label = np.minimum(gt_label, 0) # all control label < 0, tps value < 0
+            elif g_direction > 0 :
+                gt_label = np.maximum(gt_label, 0) # all control label > 0, tps value > 0
+            else:
+                print('ERROR!! direction = 0')
 
             ref_affine_tensor = torch.nn.functional.grid_sample(torch.Tensor(ref_labels[i]).unsqueeze(0).permute(0,3,1,2), grid, padding_mode='border',align_corners=self.align_corner)
             ref_affine = ref_affine_tensor.permute(0,2,3,1)[0].numpy()
             ref_affine_norm = np.linalg.norm(ref_affine[:,:,0:2], axis=2)
             ref_affine[:,:,0] /= (ref_affine_norm+np.finfo(float).eps)
             ref_affine[:,:,1] /= (ref_affine_norm+np.finfo(float).eps)
-
+            
             _,_,sim = pose_utils.get_dot_sim(ref_affine, gt_label, norm_value=17, beta1=self.tps_sim_beta1, beta2=self.tps_sim_beta2)
             sims += [sim] # [anno_size]
-        sims_sum = sum(sims)
-        sims = [torch.Tensor(sim / (sims_sum+np.finfo(float).eps)) for sim in sims] # normlize to sum 1
+        # sims_sum = sum(sims)
+        # sims = [torch.Tensor(sim / (sims_sum+np.finfo(float).eps)) for sim in sims] # normlize to sum 1
+        sims = [torch.Tensor(sim ) for sim in sims] # to tensor
         sims = [F.resize(sim.unsqueeze(0), self.load_size, interpolation=Image.BILINEAR) for sim in sims]
         sims = [sim for sim in sims]
         assert(sims[0].shape == (1,256,256))
@@ -451,23 +523,46 @@ class FashionDataset(data.Dataset):
 
         to_name = tuple_df['to'].split('.')[0]
         
-        # center = (self.load_size[0] * 0.5 + 0.5, self.load_size[1] * 0.5 + 0.5)
-        # affine_param = self.getRandomAffineParam()
-        # affine_matrix = self.get_affine_matrix(center=center, angle=affine_param['angle'], translate=affine_param['shift'], scale=affine_param['scale'], shear=0)
-        ref_xs = [self.load_image(tuple_df, from_idx) for from_idx in from_indices]
-        g_x = self.load_image(tuple_df, 'to')
+        center = (self.load_size[0] * 0.5, self.load_size[1] * 0.5)
+        
         image_end = time.time()
 
-        ref_skeletons = [self.load_skeleton(tuple_df, from_idx) for from_idx in from_indices]
-        ref_js = [self.load_keypoints(tuple_df, from_idx) for from_idx in from_indices]
-        g_skeleton = self.load_skeleton(tuple_df, 'to')
         g_j = self.load_keypoints(tuple_df, 'to')
+        ref_js = []
+        ref_scale = []
+        ref_trans = []
+        ref_affine_params = [None]*self._nb_inputs
+        ref_affine_matrixs = [None]*self._nb_inputs
+        if self.align_input:
+            for i, from_idx in enumerate(from_indices):
+                ref_js += [self.load_keypoints(tuple_df, from_idx)]
 
-        ref_parsings = [self.load_parsing(tuple_df, from_idx, categories=self._parsing_categories) for from_idx in from_indices] if self.use_parsing else None
+                scale, trans = pose_utils.get_scale_trans(ref_js[i][::-1,:], g_j[::-1,:])
+                ref_scale += [scale]
+                ref_trans += [trans]
+                affine_param = dict()
+                affine_param['angle']=0
+                affine_param['scale']=scale
+                affine_param['shift']=(trans[0],trans[1])
+                affine_matrix = self.get_affine_matrix(center=center, angle=0, translate=trans, scale=scale, shear=0)
+                ref_affine_params[i]= affine_param
+                ref_affine_matrixs[i]= affine_matrix
+        # print(scale,trans)
+        
+
+        ref_xs = [self.load_image(tuple_df, from_idx, ref_affine_params[i]) for i, from_idx in enumerate(from_indices)]
+        g_x = self.load_image(tuple_df, 'to')
+
+        g_skeleton = self.load_skeleton(tuple_df, 'to')
+        ref_skeletons = [self.load_skeleton(tuple_df, from_idx, ref_affine_matrixs[i]) for i, from_idx in enumerate(from_indices)]
+
+        ref_parsings = [self.load_parsing(tuple_df, from_idx, categories=self._parsing_categories, affine=ref_affine_params[i]) for i, from_idx in enumerate(from_indices)] if self.use_parsing else None
         g_parsing = self.load_parsing(tuple_df, 'to', categories=self._parsing_categories) if self.use_parsing else None
 
-        ref_tps_labels = [self.load_tps_label(tuple_df, from_idx) for from_idx in from_indices]  if self.use_tps_sim else None
-        g_tps_label = self.load_tps_label(tuple_df, 'to') if self.use_tps_sim else None
+        ref_fg_masks = [self.load_fg_mask(tuple_df, from_idx, affine=ref_affine_params[i]) for i, from_idx in enumerate(from_indices)] if self.use_mask else None
+        g_fg_mask = self.load_fg_mask(tuple_df, 'to') if self.use_mask else None
+
+        
 
         # print('get image item time:%.3f'%(image_end-start))
         ref_ys = [ref_skeletons[i] for i in range(len(ref_skeletons))]
@@ -482,14 +577,30 @@ class FashionDataset(data.Dataset):
         # similarities = self.get_similarity_value(g_j, ref_js)
         if not self.use_tps_sim:
             similarities = self.get_normalized_Cosinesimilarity_value(g_j, ref_js) 
-        else: 
-            similarities = self.get_tps_similarity(g_j, ref_js, g_tps_label,ref_tps_labels)
+        elif self.use_label_field_tps:
+            ref_tps_labels = [self.load_tps_label(tuple_df, from_idx) for i, from_idx in enumerate(from_indices)]  if self.use_tps_sim else None
+            g_tps_label = self.load_tps_label(tuple_df, 'to') if self.use_tps_sim else None
+
+            similarities = self.get_tps_similarity(g_j, ref_js, g_tps_label,ref_tps_labels) # 不做归一化
+        else:
+            similarities = [self.load_tps_sim(tuple_df, from_idx) for i, from_idx in enumerate(from_indices)]
+            softmax_scaling = 2
+            sim_normed = torch.stack(similarities)
+            sim_normed = nn.Softmax(dim=0)(sim_normed * softmax_scaling)
+            similarities = [sim_normed[i] for i in range(len(similarities))]
+
         end = time.time()
         # print('get item time:%.3f'%(end-start))
-        if self.use_parsing:
-            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'ref_ps':ref_parsings, 'g_x':g_x, 'g_y':g_y,  'g_p':g_parsing, 'froms':from_names, 'to':to_name, 'sim':similarities}
-        else:
-            return {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'g_x':g_x, 'g_y':g_y, 'froms':from_names, 'to':to_name, 'sim':similarities}
+        return_dict = {'ref_xs':ref_xs, 'ref_ys':ref_ys, 'g_x':g_x, 'g_y':g_y, 'froms':from_names, 'to':to_name,'sim':similarities}
+        if self.use_parsing :
+            return_dict['ref_ps']=ref_parsings
+            return_dict['g_p']=g_parsing
+        if self.use_mask:
+            return_dict['ref_ms']=ref_fg_masks
+            return_dict['g_m']=g_fg_mask
+        
+        return return_dict
+
 
     def get_affine_matrix(self, center, angle, translate, scale, shear):
         matrix_inv = self.get_inverse_affine_matrix(center, angle, translate, scale, shear)

@@ -201,7 +201,7 @@ class FID():
 
             files = image_paths[start:end]
             # if resize_and_padding:
-            #     imgs = np.array([addBounding(transform.resize(imread(str(fn)).astype(np.float32), output_shape=ori_shape)) for fn in files])
+                # imgs = np.array([addBounding(transform.resize(imread(str(fn)).astype(np.float32), output_shape=ori_shape)) for fn in files])
             # else:
             imgs = np.array([imread(str(fn)).astype(np.float32) for fn in files])
             # Bring images to shape (B, 3, H, W)
@@ -358,13 +358,15 @@ class Reconstruction_Metrics():
 
                 # print(gt_image_list[index])
                 # print(input_image_list[index])
-                if resize_and_padding:
-                    img_gt   = addBounding( transform.resize((imread(str(gt_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
-                    img_pred = addBounding( transform.resize((imread(str(input_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
-                else:
-                    img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
-                    img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
+                # if resize_and_padding:
+                #     img_gt   = addBounding( transform.resize((imread(str(gt_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
+                #     img_pred = addBounding( transform.resize((imread(str(input_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
+                # else:
+                #     img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
+                #     img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
                 
+                img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
+                img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
 
                 if debug != 0:
                     plt.subplot('121')
@@ -463,7 +465,8 @@ def preprocess_path_for_deform_task(gt_path, distorted_path):
 
     for distorted_image in distorted_image_list:
         image = os.path.basename(distorted_image)
-        image = image.split('+')[-1]
+        # image = image.split('+')[-1]
+        image = image.split('_2_')[-1]
         image = image.split('_vis')[0] +'.jpg'
         gt_image = os.path.join(gt_path, image)
         if not os.path.isfile(gt_image):
@@ -616,7 +619,7 @@ class LPIPS():
 
 
         distance = np.average(result)
-        print('lpips: %.3f'%distance)
+        print('lpips: %.6f'%distance)
         return distance
 
 

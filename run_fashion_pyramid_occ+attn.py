@@ -86,12 +86,18 @@ def get_parser():
     parser.add_argument('--anno_size', type=int, nargs=2, help='input annotation size')
     parser.add_argument('--model_save_freq', type=int, default=2000, help='save model every N iters')
     parser.add_argument('--img_save_freq', type=int, default=200, help='save image every N iters')
-
+    parser.add_argument('--pretrain_flow', action='store_true')
     '''Dataset options'''
     parser.add_argument('--use_clean_pose', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--categories', type=int, default=9)
     parser.add_argument('--use_parsing', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--use_input_mask', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--GD_use_gt_mask', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--GD_use_predict_mask', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--align_input', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--use_simmap', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--joints_for_cos_sim',type=int, default=-1, help='joints used for cosine sim computation')
+    
 
     '''Model options'''
     parser.add_argument('--n_enc', type=int, default=2, help='encoder(decoder) layers ')
@@ -99,6 +105,7 @@ def get_parser():
     parser.add_argument('--norm_type', type=str, default='in', help='normalization type in network, "in" or "bn"')
     parser.add_argument('--activation', type=str, default='LeakyReLU', help='"ReLU" or "LeakyReLU"')
     parser.add_argument('--use_pose_decoder', action='store_true', help='use pose in the target decoder')
+    parser.add_argument('--use_self_attention', action='store_true', help='use sa in the target decoder')
 
     parser.add_argument('--use_spectral_G', action='store_true', help='open this if use spectral normalization in generator')
     parser.add_argument('--use_spectral_D', action='store_true', help='open this if use spectral normalization in discriminator')
@@ -113,13 +120,15 @@ def get_parser():
     parser.add_argument('--test_source', type=str, default='A15Ei5ve9BS', help='a test video in dataset as ref images')
     parser.add_argument('--test_target_motion', type=str, default='A15Ei5ve9BS', help='a test video in dataset as ref motions')
     parser.add_argument('--output_all', action='store_true', help='open this to output the full image')
+    parser.add_argument('--test_samples', type=int, default=-1, help='test how many samples, -1 means all')
 
     '''Experiment options'''
     parser.add_argument('--use_attn', action='store_true', help='use attention for multi-view parsing generation')
     parser.add_argument('--mask_sigmoid', action='store_true', help='Use Sigmoid() as mask output layer or not')
     parser.add_argument('--mask_norm_type', type=str, default='softmax', help='softmax | divsum')
     parser.add_argument('--use_tps_sim', action='store_true', help='use precomputed tps sim')
-    parser.add_argument('--tps_sim_beta1', type=float, default=5.0, help='use precomputed tps sim')
+    parser.add_argument('--use_label_field_tps', action='store_true', help='use label field tps sim if true, else use dot tps')
+    parser.add_argument('--tps_sim_beta1', type=float, default=2.0, help='use precomputed tps sim')
     parser.add_argument('--tps_sim_beta2', type=float, default=40.0, help='use precomputed tps sim')
 
     '''Loss options'''
@@ -127,16 +136,21 @@ def get_parser():
     parser.add_argument('--use_bilinear_correctness', action='store_true', help='use bilinear sampling in sample loss')
     parser.add_argument('--G_use_resample', action='store_true', help='use gaussian sampling in the target decoder')
     parser.add_argument('--use_correctness', action='store_true', help='use sample correct loss')
-    parser.add_argument('--use_flow_attn_loss', action='store_true', help='use flow attention loss')
+    parser.add_argument('--use_sim_attn_loss', action='store_true', help='sim weighted sample correctness')
+    parser.add_argument('--use_flow_attn_loss', action='store_true', help='constrain attention by flow')
     parser.add_argument('--use_flow_reg', action='store_true', help='use flow regularization')
+    parser.add_argument('--use_attn_reg', action='store_true', help='constrain attention by sim')
 
     parser.add_argument('--lambda_style', type=float, default=500.0, help='style loss')
     parser.add_argument('--lambda_content', type=float, default=0.5, help='content loss')
     parser.add_argument('--lambda_rec', type=float, default=5.0, help='L1 loss')
     parser.add_argument('--lambda_adv', type=float, default=2.0, help='GAN loss weight')
     parser.add_argument('--lambda_correctness', type=float, default=5.0, help='sample correctness weight')
+    parser.add_argument('--lambda_struct_correctness', type=float, default=20.0, help='sample correctness weight')
     parser.add_argument('--lambda_flow_reg', type=float, default=0.0025, help='regular sample loss weight')
-    parser.add_argument('--lambda_flow_attn', type=float, default=5.0, help='regular sample loss weight')
+    parser.add_argument('--lambda_attn_reg', type=float, default=1, help='regular sample loss weight')
+    parser.add_argument('--lambda_sim_attn', type=float, default=5.0, help='regular sample loss weight')
+    parser.add_argument('--lambda_flow_attn', type=float, default=0.2, help='regular sample loss weight')
     opt = parser.parse_args()
     return opt   
 
@@ -151,17 +165,11 @@ def make_ckpt_log_vis_dirs(opt, exp_name):
     path_to_visualize_dir = opt.root_dir+ 'visualize_result/{0}/'.format(exp_name)
     path_to_log_dir = opt.root_dir+ 'logs/{0}'.format(exp_name)
     
-    # path_to_visualize_dir_train = os.path.join(path_to_visualize_dir, 'train')
-    # path_to_visualize_dir_val = os.path.join(path_to_visualize_dir, 'val')
 
     if not os.path.isdir(path_to_ckpt_dir):
         os.makedirs(path_to_ckpt_dir)
     if not os.path.isdir(path_to_visualize_dir):
         os.makedirs(path_to_visualize_dir)
-    # if not os.path.isdir(path_to_visualize_dir_train):
-    #     os.makedirs(path_to_visualize_dir_train)
-    # if not os.path.isdir(path_to_visualize_dir_val):
-    #     os.makedirs(path_to_visualize_dir_val)
     if not os.path.isdir(path_to_log_dir):
         os.makedirs(path_to_log_dir)
     
@@ -181,8 +189,12 @@ def make_dataset(opt):
     path_to_dataset = opt.path_to_dataset
     train_tuples_name = 'fasion-pairs-train.csv' if opt.K==1 else 'fasion-%d_tuples-train.csv'%(opt.K+1)
     test_tuples_name = 'fasion-pairs-test.csv' if opt.K==1 else 'fasion-%d_tuples-test.csv'%(opt.K+1)
-    path_to_train_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_sim' if opt.use_tps_sim else None
-    path_to_test_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_sim'  if opt.use_tps_sim else None
+    path_to_train_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_tps_field'
+    path_to_test_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_tps_field' 
+    path_to_train_sim = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_sim'
+    path_to_test_sim = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_sim' 
+    path_to_train_parsing = os.path.join(path_to_dataset, 'train_parsing_merge/')
+    path_to_test_parsing = os.path.join(path_to_dataset, 'test_parsing_merge/')
 
     if path_to_dataset == '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion':
         dataset = FashionDataset(
@@ -195,7 +207,10 @@ def make_dataset(opt):
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
             path_to_train_label_dir=path_to_train_label,
             path_to_test_label_dir=path_to_test_label,
-            opt=opt)
+            path_to_train_sim_dir=path_to_train_sim,
+            path_to_test_sim_dir=path_to_test_sim,
+            path_to_train_parsings_dir=path_to_train_parsing, 
+            path_to_test_parsings_dir=path_to_test_parsing, opt=opt)
     else: # '/home/ljw/playground/Multi-source-Human-Image-Generation/data/fasion-dataset'
         dataset = FashionDataset(
             phase = opt.phase,
@@ -205,7 +220,10 @@ def make_dataset(opt):
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train_new_split.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test_new_split.csv'), 
-            opt=opt)
+            path_to_train_sim_dir=path_to_train_sim,
+            path_to_test_sim_dir=path_to_test_sim,
+            path_to_train_parsings_dir=path_to_train_parsing, 
+            path_to_test_parsings_dir=path_to_test_parsing, opt=opt)
     return dataset
 
 def make_dataloader(opt, dataset):
@@ -224,6 +242,17 @@ def save_discriminator(parallel, D, optimizerD, path_to_chkpt_D):
     }, path_to_chkpt_D)    
     pass
 
+def save_flow_generator(parallel,epoch,lossesG, GF,i_batch, optimizerG, path_to_chkpt_G):
+    GF_state_dict = GF.state_dict() if not parallel else GF.module.state_dict()
+    torch.save({
+        'epoch': epoch,
+        'lossesG': lossesG,
+        'GF_state_dict': GF_state_dict,
+        'i_batch': i_batch,
+        'optimizerG': optimizerG.state_dict(),
+    }, path_to_chkpt_G)
+
+
 def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,path_to_chkpt_G):
     GE_state_dict = GE.state_dict() if not parallel else GE.module.state_dict()
     GF_state_dict = GF.state_dict() if not parallel else GF.module.state_dict()
@@ -241,12 +270,14 @@ def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,pat
 def init_flowgenerator(opt, path_to_chkpt):
     image_nc = 3
     structure_nc = 21
+    flow_layers = [2,3]
     if opt.use_parsing:
         structure_nc += 20
+    if opt.use_input_mask:
+        structure_nc += 1
     if opt.use_simmap:
         image_nc += 13
-    
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= [2,3], ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = FlowGenerator(inc=3+21+22, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     if opt.parallel:
         GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
     GF = GF.to(device)
@@ -254,28 +285,17 @@ def init_flowgenerator(opt, path_to_chkpt):
     optimizerG = optim.Adam(params = list(GF.parameters()) ,
                             lr=opt.lr,
                             amsgrad=False)
+    if opt.use_scheduler:
+        lr_scheduler = ReduceLROnPlateau(optimizerG, 'min', factor=np.sqrt(0.1), patience=5, min_lr=5e-7)
+    
     if not os.path.isfile(path_to_chkpt):
         # initiate checkpoint if inexist
         GF.apply(init_weights)
-
-        print('Initiating new flow model checkpoint...')
-        if opt.parallel:
-            torch.save({
-                    'epoch': 0,
-                    'lossesG': [],
-                    'GF_state_dict': GF.module.state_dict(),
-                    'i_batch': 0,
-                    'optimizerG': optimizerG.state_dict(),
-                    }, path_to_chkpt)
-        else:
-            torch.save({
-                    'epoch': 0,
-                    'lossesG': [],
-                    'GF_state_dict': GF.state_dict(),
-                    'i_batch': 0,
-                    'optimizerG': optimizerG.state_dict(),
-                    }, path_to_chkpt)
+        
+        save_flow_generator(opt.parallel, 0, [], GF, 0, optimizerG, path_to_chkpt)
         print('...Done')
+
+    return GF, optimizerG
 
 def init_discriminator(opt, path_to_chkpt):
     D_inc = 3
@@ -303,18 +323,20 @@ def init_generator(opt, path_to_chkpt, path_to_flow_chkpt=None):
     flow_layers = [2,3]
     if opt.use_parsing:
         structure_nc += 20
+    if opt.use_input_mask:
+        structure_nc += 1
     if opt.use_simmap:
         image_nc += 13
 
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = FlowGenerator(inc=3+22+22, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     
     if not opt.use_pose_decoder:
         GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
     else:
-        GD = PoseAwareAppearanceDecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
-            activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+        GD = PoseAwareAppearanceDecoder(structure_nc=structure_nc, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+            activation=opt.activation, use_spectral_norm=opt.use_spectral_G,use_self_attention=opt.use_self_attention, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
 
     if opt.parallel:
         GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
@@ -383,14 +405,16 @@ def train_flow_net(opt, exp_name):
     i_batch_current = checkpoint['i_batch']
     i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
     optimizerG.load_state_dict(checkpoint['optimizerG'])
-    
-
+    # from loss.externel_functions import VGG19
+    # GE = VGG19().to(device)
     '''create tensorboard writter'''
     writer = create_writer(path_to_log_dir)
     
     '''Losses'''
-    criterionG = LossG(device=device)
+    criterionL1 = nn.L1Loss().to(device)
     criterionCorrectness = PerceptualCorrectness().to(device)
+    criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+
 
     """ Training start """
     for epoch in range(epochCurrent, opt.epochs):
@@ -413,76 +437,105 @@ def train_flow_net(opt, exp_name):
 
             g_x = g_x.to(device) # [B, 3, 256, 256]
             g_y = g_y.to(device) # [B, 20, 256, 256]
+
+            if opt.use_input_mask:
+                ref_ms = batch_data['ref_ms']
+                g_m = batch_data['g_m']
+                assert(len(ref_ms)==opt.K)
+                for i in range(opt.K):
+                    ref_ms[i] = ref_ms[i].to(device)
+                g_m = g_m.to(device)
             
-            flows, masks, xfs = [], [], []
-            flows_down,masks_down, xfs_warp = [], [], []
-            for k in range(0, opt.K):
-                flow_k, mask_k = GF(ref_xs[k], ref_ys[k], g_y)
-                xf_k = GE(ref_xs[k])
-                flow_k_down = F.interpolate(flow_k * (xf_k.shape[2]-1) / (flow_k.shape[2]-1), size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
-                mask_k_down = F.interpolate(mask_k, size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
-                xf_k_warp = warp_flow(xf_k, flow_k_down, align_corners=opt.align_corner)
-
-                flows += [flow_k]
-                masks += [mask_k]
-                xfs += [xf_k]
-                flows_down += [flow_k_down]
-                masks_down += [mask_k_down]
-                xfs_warp += [xf_k_warp]
+            flows, flow_ones = [], []
             
-            '''normalize masks to sum to 1'''
-            mask_cat = torch.cat(masks_down, dim=1)
-            if opt.mask_norm_type == 'softmax':
-                mask_normed = F.softmax(mask_cat, dim=1) # pixel wise sum to 1
-            else:
-                eps = 1e-12
-                mask_normed = mask_cat / (torch.sum(mask_cat, dim=1).unsqueeze(1)+eps) # pixel wise sum to 1
-
-            xfs_warp_masked = None
-            xf_merge = None
             for k in range(0, opt.K):
-                mask_normed_k_down = mask_normed[:,k:k+1,...]
-
-                if xfs_warp_masked is None:
-                    xfs_warp_masked = [xfs_warp[k] * mask_normed_k_down]
-                    xf_merge = xfs_warp[k] * mask_normed_k_down
+                if opt.use_input_mask:
+                    # flow_ks, mask_ks, _ = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), torch.cat((g_y,g_m),dim=1)) # 32, 64
+                    flow_ks, mask_ks, _ = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), g_y) # 32, 64
                 else:
-                    xfs_warp_masked.append(xfs_warp[k] * mask_normed_k_down)
-                    xf_merge += xfs_warp[k] * mask_normed_k_down
+                    flow_ks, mask_ks, _ = GF(ref_xs[k], ref_ys[k], g_y) # 32, 64
 
-            x_hat = GD(xf_merge)
+                flow_k = flow_ks[1]
+                # print(flow_k.shape)
 
-            lossG_content, lossG_style, lossG_L1 = criterionG(g_x, x_hat)
+                flows += [flow_ks]
+                flow_ones += [flow_k ]
 
-            lossG_content = lossG_content * opt.lambda_content
-            lossG_style = lossG_style * opt.lambda_style
-            lossG_L1 = lossG_L1 * opt.lambda_rec
 
-            writer.add_scalar('{0}/lossG_content'.format(opt.phase), lossG_content.item(), global_step=i_batch_total, walltime=None)
-            writer.add_scalar('{0}/lossG_style'.format(opt.phase), lossG_style.item(), global_step=i_batch_total, walltime=None)
-            writer.add_scalar('{0}/lossG_L1'.format(opt.phase), lossG_L1.item(), global_step=i_batch_total, walltime=None)
-            lossG = lossG_content + lossG_style + lossG_L1
-
+            # x_hat = GD(xf_merge)
+            # x_hat =  warp_flow(F.interpolate(ref_xs[k], size=flow_k.shape[2:], mode='bilinear',align_corners=opt.align_corner), flow_k, align_corners=opt.align_corner)
+            # x_hat = F.interpolate(x_hat, size=g_x.shape[2:],mode='bilinear',align_corners=opt.align_corner)
+            down_ref_xk = F.interpolate(ref_xs[k], size=flow_k.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+            x_hat_down =  warp_flow(down_ref_xk, flow_k, align_corners=opt.align_corner)
+            x_hat = F.interpolate(x_hat_down, size=ref_xs[k].shape[2:], mode='bilinear', align_corners=opt.align_corner)
+            loss_correct=0
+            for k in range(opt.K):
+                loss_correct += criterionCorrectness(g_x, ref_xs[k], flows[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness)
+                # loss_correct += criterionL1(xfs_warp[k], g_xf)
+            loss_correct = loss_correct/opt.K * opt.lambda_correctness
+            lossG = loss_correct
+            writer.add_scalar('{0}/loss_correct'.format(opt.phase), loss_correct.item(), global_step=i_batch_total, walltime=None)
+            
+            loss_regular = 0
+            if opt.use_flow_reg:
+                for k in range(opt.K):
+                    loss_regular += criterionReg(flows[k])
+                
+                loss_regular = loss_regular / opt.K * opt.lambda_flow_reg
+            
+                lossG += loss_regular
+                writer.add_scalar('{0}/loss_regular'.format(opt.phase), loss_regular.item(), global_step=i_batch_total, walltime=None)
+            
+            loss_struct = 0
+            if opt.use_input_mask:
+                for k in range(opt.K):
+                    flow_ks = flows[k]
+                    for l in range(len(flow_ks)):
+                        flow_kl = flow_ks[l]
+                        ref_m_down = F.interpolate(ref_ms[k], size=flow_kl.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+                        warp_m_down = warp_flow(ref_m_down, flow_kl, align_corners=opt.align_corner)
+                        g_m_down = F.interpolate(g_m, size=flow_kl.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+                        loss_struct += criterionL1(warp_m_down, g_m_down)
+                loss_struct /= opt.K * opt.lambda_struct_correctness
+                lossG += loss_struct
+                writer.add_scalar('{0}/loss_struct'.format(opt.phase), loss_struct.item(), global_step=i_batch_total, walltime=None)
+            
+            
             optimizerG.zero_grad()
             lossG.backward(retain_graph=False)
             optimizerG.step()
             epoch_loss_G += lossG.item()
             epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
             i_batch_total += 1
-            
-            post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
-
+            post_fix_str = 'Epoch_loss=%.3f, G=%.3f, Cor=%.3f'%(epoch_loss_G_moving, lossG.item(), loss_correct.item())
+            if opt.use_input_mask:
+                post_fix_str += ', Reg=%.3f'%loss_regular.item()
+            if opt.use_flow_reg:
+                post_fix_str += ', MaskCorr=%.3f'%loss_struct.item()
             pbar.set_postfix_str(post_fix_str)
             if opt.use_scheduler:
                 lr_scheduler.step(epoch_loss_G_moving)
             lossesG.append(lossG.item())
             
-            if i_batch * opt.batch_size % opt.model_save_freq == 0:
-                final_img,_,_ = get_visualize_result(opt, ref_xs, ref_ys,None, g_x, g_y,None,None, xf_merge, x_hat,\
-                    flows, F.interpolate(mask_normed, size=g_x.shape[2:], mode='bilinear',align_corners=opt.align_corner), xfs, xfs_warp, xfs_warp_masked)
+            from util.vis_util import get_flow_visualize_result
+            if i_batch % opt.img_save_freq == 0: 
+                if not opt.use_input_mask:   
+                    final_img,_,_ = get_flow_visualize_result(opt, ref_xs, ref_ys,None, g_x, g_y,None,None, x_hat,\
+                        flow_ones)
+                else:
+                    ref_m_down = F.interpolate(ref_ms[0], size=flow_ones[0].shape[2:], mode='bilinear', align_corners=opt.align_corner)
+                    m_hat = warp_flow(ref_m_down,flow_ones[0],align_corners=opt.align_corner)
+                    final_img,_,_ = get_flow_visualize_result(opt, ref_xs, ref_ys,ref_ms, g_x, g_y,g_m,m_hat, x_hat,\
+                        flow_ones)
                 
                 plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
-     
+
+            if i_batch % opt.model_save_freq == 0:
+                path_to_save_G = path_to_ckpt_dir + 'epoch_{}_batch_{}_G.tar'.format(epoch, i_batch)
+                save_flow_generator(opt.parallel, epoch, lossesG, GF, i_batch, optimizerG, path_to_save_G)
+        save_flow_generator(opt.parallel, epoch, lossesG, GF, i_batch, optimizerG, path_to_chkpt)
+
+    writer.close()   
 def train(opt, exp_name):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
     
@@ -546,7 +599,7 @@ def train(opt, exp_name):
     criterionCorrectness = PerceptualCorrectness().to(device)
     criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
     criterionFlowAttn = FlowAttnLoss().to(device)
-
+    criterionL1 = nn.L1Loss().to(device)
     print('-------Training Start--------')
     """ Training start """
     for epoch in range(epochCurrent, opt.epochs):
@@ -554,18 +607,26 @@ def train(opt, exp_name):
             i_batch_current = 0
         epoch_loss_G = 0
         pbar = tqdm(dataloader, leave=True, initial=0)
-        pbar.set_description('[{0:>4}/{1:>4}], G_lr-{2},D_lr-{3}'.format(epoch,opt.epochs,optimizerG.param_groups[0]['lr'],optimizerD.param_groups[0]['lr']))
+        pbar.set_description('[{0:>4}/{1:>4}]'.format(epoch,opt.epochs))
         
         for i_batch, batch_data in enumerate(pbar, start=0):
             ref_xs = batch_data['ref_xs']
             ref_ys = batch_data['ref_ys']
             g_x = batch_data['g_x']
             g_y = batch_data['g_y']
-            if opt.use_flow_attn_loss:
+            if opt.use_sim_attn_loss or opt.use_attn_reg:
                 sims = batch_data['sim']
                 assert(len(sims)==opt.K)
                 for i in range(opt.K):
                     sims[i] = sims[i].to(device)
+            
+            if opt.use_input_mask:
+                ref_ms = batch_data['ref_ms']
+                g_m = batch_data['g_m']
+                assert(len(ref_ms)==opt.K)
+                for i in range(opt.K):
+                    ref_ms[i] = ref_ms[i].to(device)
+                g_m = g_m.to(device)
                     
             assert(len(ref_xs)==len(ref_ys))
             assert(len(ref_xs)==opt.K)
@@ -587,8 +648,11 @@ def train(opt, exp_name):
                 gf = GE(g_x)[0:2]
             for k in range(0, opt.K):
                 # get 2 flows, masks and attns at two resolution 32, 64
-
-                flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k], g_y)
+                if opt.use_input_mask:
+                    flow_ks, mask_ks, attn_ks = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), torch.cat((g_y,g_m),dim=1)) # 32, 64
+                    # flow_ks, mask_ks, attn_ks = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), g_y) # 32, 64
+                else:
+                    flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k], g_y) # 32, 64
                 
                 # get 2 source features at resolution 32, 64
                 xf_ks = GE(ref_xs[k])[0:2]
@@ -615,6 +679,19 @@ def train(opt, exp_name):
                     temp += [attn_norm[i][:,k:k+1,...]] # += [1,32,32]
                 attn_norm_trans += [temp]
 
+            if opt.use_input_mask:
+                mask_warp_merged = []
+                for i in range(len(attn_norm)):
+                    temp = []
+                    for k in range(opt.K):
+                        ref_mk = F.interpolate(ref_ms[k], attn_norm[i].shape[-2:], mode='bilinear', align_corners=opt.align_corner)
+                        ref_warped_mk = warp_flow(ref_mk, flows[k][i], align_corners=opt.align_corner)
+                        temp += [ref_warped_mk * attn_norm[i][:,k:k+1,...] ]
+                    temp_merge = sum(temp)
+                    temp_merge_resize = F.interpolate(temp_merge, ref_ms[0].shape[-2:], mode='bilinear', align_corners=opt.align_corner)
+                
+                    mask_warp_merged += [temp_merge_resize]
+                mask_merged = sum(mask_warp_merged) / len(attn_norm)
             ### GD input is:
             # flows: K * [B,2,32,32][B,2,64,64]
             # masks: K * [B,1,32,32][B,1,64,64]
@@ -629,7 +706,13 @@ def train(opt, exp_name):
             # print('mask shape 1:',mask_norm_trans[0][0].shape)
             # print('mask shape 2:',mask_norm_trans[0][1].shape)
             if opt.use_pose_decoder:
-                x_hat = GD(g_y, xfs, flows, masks, attn_norm_trans)
+                if opt.use_input_mask:
+                    if opt.GD_use_gt_mask:
+                        x_hat = GD(torch.cat((g_y, g_m),dim=1), xfs, flows, masks, attn_norm_trans)
+                    elif opt.GD_use_predict_mask:
+                        x_hat = GD(torch.cat((g_y, mask_merged),dim=1), xfs, flows, masks, attn_norm_trans)
+                else:
+                    x_hat = GD(g_y, xfs, flows, masks, attn_norm_trans)
             else:
                 x_hat = GD(xfs, flows, masks, attn_norm_trans)
 
@@ -662,6 +745,8 @@ def train(opt, exp_name):
             writer.add_scalar('{0}/lossG_style'.format(opt.phase), lossG_style.item(), global_step=i_batch_total, walltime=None)
             writer.add_scalar('{0}/lossG_L1'.format(opt.phase), lossG_L1.item(), global_step=i_batch_total, walltime=None)
             lossG = lossG_content + lossG_style + lossG_L1
+            # L1, L_vgg
+            # GAN
             if opt.use_adv:
                 _freeze(D)
                 D_fake = D(x_hat)
@@ -669,6 +754,7 @@ def train(opt, exp_name):
                 writer.add_scalar('{0}/lossG_adv'.format(opt.phase), lossG_adv.item(), global_step=i_batch_total, walltime=None)
                 lossG = lossG + lossG_adv
             
+            # sample correctness
             if opt.use_correctness:
                 loss_correct=0
                 for k in range(opt.K):
@@ -678,8 +764,9 @@ def train(opt, exp_name):
                 writer.add_scalar('{0}/lossG_correct'.format(opt.phase), loss_correct.item(), global_step=i_batch_total, walltime=None)
                 lossG = lossG + loss_correct
 
-            if opt.use_flow_attn_loss:
-                loss_flow_attn = 0 #  sum_i(w_i(P_G-P_i)), wi = exp(-attn)
+            # weighted sample correctness
+            if opt.use_sim_attn_loss:
+                loss_sim_attn = 0 #  sum_i(w_i(P_G-P_i)), wi = exp(-attn)
                 sim = []
                 
                 for k in range(0, opt.K):
@@ -691,13 +778,43 @@ def train(opt, exp_name):
                         tt+=[down_sim]
                     sim += [tt]
                 for k in range(0, opt.K):
-                    loss_flow_attn += criterionFlowAttn(g_x, ref_xs[k], flows[k], sim[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness) #  
-                loss_flow_attn = loss_flow_attn / opt.K * opt.lambda_flow_attn
+                    loss_sim_attn += criterionFlowAttn(g_x, ref_xs[k], flows[k], sim[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness) #  
+                loss_sim_attn = loss_sim_attn / opt.K * opt.lambda_sim_attn
 
-                # lossG += loss_flow_attn
+                lossG += loss_sim_attn
+                writer.add_scalar('{0}/loss_sim_attn'.format(opt.phase), loss_sim_attn.item(), global_step=i_batch_total, walltime=None)
+
+            # attn_flow
+            if opt.use_flow_attn_loss:
+                assert(opt.use_input_mask)
+                loss_flow_attn = 0
+                for k in range(opt.K):
+                    for l in range(len(attns[k])):# [B,1,H,W] * [B,1,H,W]
+                        b,c,h,w = flows[k][l].shape
+                        ref_m_down = F.interpolate(ref_ms[k], (h,w), mode='bilinear', align_corners=opt.align_corner)
+                        warp_m_down = warp_flow(ref_m_down, flows[k][l], align_corners=opt.align_corner)
+                        # print(torch.sum(torch.norm(flows[k][l],dim=1,keepdim=True)*warp_m_down * attn_norm_trans[k][l])/torch.sum(warp_m_down))
+                        loss_flow_attn += torch.sum(torch.norm(flows[k][l],dim=1,keepdim=True)*warp_m_down * attn_norm_trans[k][l])/torch.sum(warp_m_down)
+                loss_flow_attn = loss_flow_attn / opt.K * opt.lambda_flow_attn
+                lossG += loss_flow_attn
                 writer.add_scalar('{0}/loss_flow_attn'.format(opt.phase), loss_flow_attn.item(), global_step=i_batch_total, walltime=None)
 
+            # attn_sim
+            if opt.use_attn_reg:
+                loss_attn_reg = 0 #  sum(attn_i * sim_i)/2 + attn_GD /2 (sum(attn_i,attn_GD)==1, sum(sim_i)==1)
+                for k in range(0, opt.K):
+                    for i in range(0, len(attns[k])):
+                        b,c,h,w = flows[0][i].shape
+                        # ref_m_down = F.interpolate(ref_ms[k], (h,w), mode='bilinear', align_corners=opt.align_corner)
+                        # warp_m_down = warp_flow(ref_m_down, flows[k][l], align_corners=opt.align_corner)
+                        down_sim = F.interpolate(sims[k], size=(h,w), mode='bilinear',align_corners=opt.align_corner)
+                        loss_attn_reg += torch.mean(attn_norm_trans[k][i] * (1-down_sim))
+                    # loss_attn_reg += torch.mean(attn_normed[i][:,0:1,...] /(opt.K+1))
+                loss_attn_reg = loss_attn_reg / opt.K * opt.lambda_attn_reg
+                lossG += loss_attn_reg
+                writer.add_scalar('{0}/loss_attn_reg'.format(opt.phase), loss_attn_reg.item(), global_step=i_batch_total, walltime=None)
 
+            # flow_reg
             if opt.use_flow_reg:
                 loss_regular=0
                 for k in range(opt.K):
@@ -708,6 +825,21 @@ def train(opt, exp_name):
                 lossG += loss_regular
                 writer.add_scalar('{0}/loss_regular'.format(opt.phase), loss_regular.item(), global_step=i_batch_total, walltime=None)
 
+            # flow_mask
+            loss_struct = 0
+            if opt.use_input_mask:
+                for k in range(opt.K):
+                    flow_ks = flows[k]
+                    for l in range(len(flow_ks)):
+                        flow_kl = flow_ks[l]
+                        ref_m_down = F.interpolate(ref_ms[k], size=flow_kl.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+                        warp_m_down = warp_flow(ref_m_down, flow_kl, align_corners=opt.align_corner)
+                        g_m_down = F.interpolate(g_m, size=flow_kl.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+                        loss_struct += criterionL1(warp_m_down, g_m_down)
+                loss_struct = loss_struct / opt.K * opt.lambda_struct_correctness
+                lossG += loss_struct
+                writer.add_scalar('{0}/loss_struct'.format(opt.phase), loss_struct.item(), global_step=i_batch_total, walltime=None)
+            
 
             lossG.backward(retain_graph=False)
             optimizerG.step()
@@ -715,15 +847,21 @@ def train(opt, exp_name):
             epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
             i_batch_total += 1
             
-            post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
-            if opt.use_adv:
-                post_fix_str += ', G_adv=%.3f, D_loss=%.3f'%(lossG_adv.item(), lossD.item())
+            post_fix_str = 'Epo_L=%.3f, G=%.2f,L1=%.2f,L_cnt=%.2f,L_sty=%.2f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
             if opt.use_correctness:
-                post_fix_str += ', G_cor=%.3f'%(loss_correct.item())
+                post_fix_str += ', corr=%.2f'%(loss_correct.item())
+            if opt.use_adv:
+                post_fix_str += ', G_adv=%.2f, D_L=%.2f'%(lossG_adv.item(), lossD.item())
             if opt.use_flow_reg:
-                post_fix_str += ', G_reg=%.3f'%(loss_regular.item())
+                post_fix_str += ', reg=%.2f'%(loss_regular.item())
+            if opt.use_sim_attn_loss:
+                post_fix_str += ', sim_atn=%.2f'%(loss_sim_attn.item())
             if opt.use_flow_attn_loss:
-                post_fix_str += ', G_flo=%.3f'%(loss_flow_attn.item())
+                post_fix_str += ', flo_atn=%.2f'%(loss_flow_attn.item())
+            if opt.use_attn_reg:
+                post_fix_str += ', atnreg=%.2f'%(loss_attn_reg.item())
+            if opt.use_input_mask:
+                post_fix_str += ', struct=%.2f'%(loss_struct.item())
             
             pbar.set_postfix_str(post_fix_str)
             if opt.use_scheduler:
@@ -731,23 +869,18 @@ def train(opt, exp_name):
             lossesG.append(lossG.item())
             
             if i_batch % opt.img_save_freq == 0:
-                final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x, x_hat, g_y,None,None,\
-                    flows, attn_norm_trans,masks, xfs, gf)
-                if opt.use_flow_attn_loss:
-                    if not opt.use_tps_sim:
-                        sim0=tensor2im(sim[0][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim1=tensor2im(sim[1][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        final_img[256*2:256*3, 256*4:256*5] = sim0
-                        final_img[256*2:256*3, 256*5:256*6] = sim1
-                    else:
-                        sim00=tensor2im(sim[0][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim10=tensor2im(sim[1][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim01=tensor2im(sim[0][1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        sim11=tensor2im(sim[1][1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
-                        final_img[256*2:256*3, 256*4:256*5] = sim00
-                        final_img[256*2:256*3, 256*5:256*6] = sim10
-                        final_img[256*3:256*4, 256*4:256*5] = sim01
-                        final_img[256*3:256*4, 256*5:256*6] = sim11
+                if not opt.use_input_mask: 
+                    final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x,x_hat, g_y,None,None, \
+                                flows, attn_norm_trans,masks, xfs, gf)
+                else:
+                    final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,ref_ms, g_x,x_hat, g_y,g_m,mask_merged, \
+                                flows, attn_norm_trans,masks, xfs, gf)
+
+                if opt.use_sim_attn_loss or opt.use_attn_reg:
+                    sim0=tensor2im(sims[0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                    sim1=tensor2im(sims[1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                    final_img[256*2:256*3, 256*4:256*5] = sim0
+                    final_img[256*2:256*3, 256*5:256*6] = sim1
                     
                 plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
 
@@ -760,8 +893,12 @@ def train(opt, exp_name):
         save_generator(opt.parallel, epoch+1, lossesG, GE, GF, GD, i_batch, optimizerG, path_to_chkpt_G)
         save_discriminator(opt.parallel, D, optimizerD, path_to_chkpt_D)
         '''save image result'''
-        final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x,x_hat, g_y,None,None, \
-                    flows, attn_norm_trans,masks, xfs, gf)
+        if not opt.use_input_mask: 
+            final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,None, g_x,x_hat, g_y,None,None, \
+                        flows, attn_norm_trans,masks, xfs, gf)
+        else:
+            final_img,_,_ = get_pyramid_visualize_result(opt, ref_xs, ref_ys,ref_ms, g_x,x_hat, g_y,g_m,None, \
+                        flows, attn_norm_trans,masks, xfs, gf)
 
         plt.imsave(os.path.join(path_to_visualize_dir,"epoch_latest.png"), final_img)
         
@@ -800,16 +937,18 @@ def test(opt):
     flow_layers = [2,3]
     if opt.use_parsing:
         structure_nc += 20
+    if opt.use_input_mask:
+        structure_nc += 1
     if opt.use_simmap:
         image_nc += 13
 
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GF = FlowGenerator(inc=3+21+22, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     if not opt.use_pose_decoder:
         GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
     else:
-        GD = PoseAwareAppearanceDecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+        GD = PoseAwareAppearanceDecoder(structure_nc=structure_nc, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
             activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
     
     if opt.parallel:
@@ -845,8 +984,10 @@ def test(opt):
     """ Test start """
     epoch_loss_G = 0
     pbar = tqdm(dataloader, leave=True, initial=0)
-    
+    num_test_samples = opt.test_samples if opt.test_samples > 0 else len(dataloader)
     for i_batch, batch_data in enumerate(pbar, start=0):
+        if i_batch == num_test_samples:
+            break
         model_G_start = time.time()
         froms = batch_data['froms']
         to = batch_data['to']
@@ -860,6 +1001,18 @@ def test(opt):
             ref_xs[i] = ref_xs[i].to(device)
             ref_ys[i] = ref_ys[i].to(device)
 
+        if opt.use_sim_attn_loss or opt.use_attn_reg:
+            sims = batch_data['sim']
+            assert(len(sims)==opt.K)
+            for i in range(opt.K):
+                sims[i] = sims[i].to(device)
+        if opt.use_input_mask:
+            ref_ms = batch_data['ref_ms']
+            g_m = batch_data['g_m']
+            assert(len(ref_ms)==opt.K)
+            for i in range(opt.K):
+                ref_ms[i] = ref_ms[i].to(device)
+            g_m = g_m.to(device)
         g_x = g_x.to(device) # [B, 3, 256, 256]
         g_y = g_y.to(device) # [B, 20, 256, 256]
         
@@ -875,7 +1028,11 @@ def test(opt):
         
         for k in range(0, opt.K):
             # get 2 flows and masks at two resolution 32, 64
-            flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k], g_y)
+            if opt.use_input_mask:
+                # flow_ks, mask_ks, attn_ks = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), torch.cat((g_y,g_m),dim=1)) # 32, 64
+                flow_ks, mask_ks, attn_ks = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), g_y) # 32, 64
+            else:
+                flow_ks, mask_ks, attn_ks = GF(ref_xs[k], ref_ys[k], g_y) # 32, 64
 
             
             # get 2 source features at resolution 32, 64
@@ -903,6 +1060,20 @@ def test(opt):
                 temp += [attn_norm[i][:,k:k+1,...]] # += [1,32,32]
             attn_norm_trans += [temp]
 
+        if opt.use_input_mask:
+            mask_warp_merged = []
+            for i in range(len(attn_norm)):
+                temp = []
+                for k in range(opt.K):
+                    ref_mk = F.interpolate(ref_ms[k], attn_norm[i].shape[-2:], mode='bilinear', align_corners=opt.align_corner)
+                    ref_warped_mk = warp_flow(ref_mk, flows[k][i], align_corners=opt.align_corner)
+                    temp += [ref_warped_mk * attn_norm[i][:,k:k+1,...] ]
+                temp_merge = sum(temp)
+                temp_merge_resize = F.interpolate(temp_merge, ref_ms[0].shape[-2:], mode='bilinear', align_corners=opt.align_corner)
+            
+                mask_warp_merged += [temp_merge_resize]
+            mask_merged = sum(mask_warp_merged) / len(attn_norm)
+            
         ### GD input is:
         # flows: K * [B,2,32,32][B,2,64,64]
         # masks: K * [B,1,32,32][B,1,64,64]
@@ -917,10 +1088,15 @@ def test(opt):
         # print('mask shape 1:',mask_norm_trans[0][0].shape)
         # print('mask shape 2:',mask_norm_trans[0][1].shape)
         if opt.use_pose_decoder:
-            x_hat = GD(g_y, xfs, flows, masks, attn_norm_trans)
+            if opt.use_input_mask:
+                if opt.GD_use_gt_mask:
+                    x_hat = GD(torch.cat((g_y, g_m),dim=1), xfs, flows, masks, attn_norm_trans)
+                elif opt.GD_use_predict_mask:
+                    x_hat = GD(torch.cat((g_y, mask_merged),dim=1), xfs, flows, masks, attn_norm_trans)
+            else:
+                x_hat = GD(g_y, xfs, flows, masks, attn_norm_trans)
         else:
             x_hat = GD(xfs, flows, masks, attn_norm_trans)
-        model_G_end = time.time()
         # print('model G time:%.3f'%(model_G_end-model_G_start))
         lossG_content, lossG_style, lossG_L1 = criterionG(g_x, x_hat)
             
@@ -937,9 +1113,14 @@ def test(opt):
         pbar.set_postfix_str(post_fix_str)
         visual_start = time.time()
 
-        full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
-                    ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
-                        gp=None,gp_hat=None,flows=flows, masks_normed=attn_norm_trans, occlusions=masks, ref_features=xfs, g_features=gf)
+        if not opt.use_input_mask: 
+            full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
+                        ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
+                            gp=None,gp_hat=None,flows=flows, masks_normed=attn_norm_trans, occlusions=masks, ref_features=xfs, g_features=gf)
+        else:
+            full_img,simp_img, out_img = get_pyramid_visualize_result(opt, \
+                        ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=ref_ms, gx=g_x, x_hat=x_hat, gy=g_y,\
+                            gp=g_m,gp_hat=mask_merged,flows=flows, masks_normed=attn_norm_trans, occlusions=masks, ref_features=xfs, g_features=gf)
         visual_end = time.time()
         # print('visual time:%.3f'%(visual_end-visual_start))
         
@@ -953,12 +1134,220 @@ def test(opt):
         Image.fromarray(out_img).save(os.path.join(test_result_eval_dir,"{0}_vis.jpg".format(test_name)))
         Image.fromarray(simp_img).save(os.path.join(test_result_dir,"{0}_simp.jpg".format(test_name)))
         if opt.output_all:
+            if opt.use_sim_attn_loss or opt.use_attn_reg:
+                sim0=tensor2im(sims[0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                sim1=tensor2im(sims[1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                full_img[256*2:256*3, -2*256:-256] = sim0
+                full_img[256*2:256*3, -256:] = sim1
             Image.fromarray(full_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
         save_end = time.time()
         # print('save time:%.3f'%(save_end-save_start))
         
     pass
 
+def test_flownet(opt):
+    from util.io import load_image, load_skeleton, load_parsing, transform_image
+    import time
+    
+
+    print('-----------TESTING-----------')
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
+    experiment_name = opt.test_id
+    
+    '''Set logging,checkpoint,vis dir'''
+    path_to_ckpt_dir = opt.root_dir+ 'checkpoints/{0}/'.format(experiment_name)
+    
+    path_to_chkpt_G = path_to_ckpt_dir + '{0}.tar'.format(opt.test_ckpt_name) 
+    test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    test_result_eval_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot_eval/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    if not os.path.isdir(test_result_dir):
+        os.makedirs(test_result_dir)
+    if not os.path.isdir(test_result_eval_dir):
+        os.makedirs(test_result_eval_dir)
+
+    
+    '''Create dataset and dataloader'''
+    dataset = make_dataset(opt)
+    dataloader = make_dataloader(opt, dataset)
+
+    '''Create Model'''
+    image_nc = 3
+    structure_nc = 21
+    flow_layers = [2,3]
+    if opt.use_parsing:
+        structure_nc += 20
+    if opt.use_input_mask:
+        structure_nc += 1
+    if opt.use_simmap:
+        image_nc += 13
+    
+    GF = FlowGenerator(inc=3+21+22, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    if opt.parallel:
+        GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
+    GF = GF.to(device)
+    checkpoint = torch.load(path_to_chkpt_G, map_location=cpu)
+    if opt.parallel:
+        GF.module.load_state_dict(checkpoint['GF_state_dict'], strict=False)
+    else:
+        GF.load_state_dict(checkpoint['GF_state_dict'], strict=False)
+    epochCurrent = checkpoint['epoch']
+    lossesG = checkpoint['lossesG']
+    i_batch_current = checkpoint['i_batch']
+    from loss.externel_functions import VGG19
+    GE = VGG19().to(device)
+    criterionL1 = nn.L1Loss().to(device)
+    criterionCorrectness = PerceptualCorrectness().to(device)
+    criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+
+    """ Test start """
+    epoch_loss_G = 0
+    pbar = tqdm(dataloader, leave=True, initial=0)
+    num_test_samples = opt.test_samples if opt.test_samples > 0 else len(dataloader)
+    for i_batch, batch_data in enumerate(pbar, start=0):
+        if i_batch == num_test_samples:
+            break
+        model_G_start = time.time()
+        froms = batch_data['froms']
+        to = batch_data['to']
+        ref_xs = batch_data['ref_xs']
+        ref_ys = batch_data['ref_ys']
+        g_x = batch_data['g_x']
+        g_y = batch_data['g_y']
+        assert(len(ref_xs)==len(ref_ys))
+        assert(len(ref_xs)==opt.K)
+        for i in range(len(ref_xs)):
+            ref_xs[i] = ref_xs[i].to(device)
+            ref_ys[i] = ref_ys[i].to(device)
+        if opt.use_input_mask:
+            ref_ms = batch_data['ref_ms']
+            g_m = batch_data['g_m']
+            assert(len(ref_ms)==opt.K)
+            for i in range(opt.K):
+                ref_ms[i] = ref_ms[i].to(device)
+            g_m = g_m.to(device)
+        if opt.use_sim_attn_loss or opt.use_attn_reg:
+            sims = batch_data['sim']
+            assert(len(sims)==opt.K)
+            for i in range(opt.K):
+                sims[i] = sims[i].to(device)
+
+
+        g_x = g_x.to(device) # [B, 3, 256, 256]
+        g_y = g_y.to(device) # [B, 20, 256, 256]
+        
+        flows, flow_ones, masks, xfs = [], [], [], []
+        flows_down,masks_down, xfs_warp = [], [], []
+        # flows: K *[tensor[2,32,32] tensor[2,64,64]]
+        # masks: K *[tensor[1,32,32] tensor[1,64,64]]
+        # xfs: K *[tensor[256,32,32] tensor[128,64,64]]
+        g_xf = GE(g_x)['relu4_1']
+        
+        for k in range(0, opt.K):
+            if opt.use_input_mask:
+                # flow_ks, mask_ks, _ = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), torch.cat((g_y,g_m),dim=1)) # 32, 64
+                flow_ks, mask_ks, _ = GF(ref_xs[k], torch.cat((ref_ys[k],ref_ms[k]),dim=1), g_y) # 32, 64
+            else:
+                flow_ks, mask_ks, _ = GF(ref_xs[k], ref_ys[k], g_y) # 32, 64
+
+            flow_k = flow_ks[1]
+            # print(flow_k.shape)
+            mask_k = mask_ks[1]
+            # print(mask_k.shape)
+
+            xf_k = GE(ref_xs[k])['relu4_1']
+            # print(xf_k.shape)
+            flow_k_down = F.interpolate(flow_k * xf_k.shape[2] / flow_k.shape[2], size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
+
+            mask_k_down = F.interpolate(mask_k, size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
+            xf_k_warp = warp_flow(xf_k, flow_k_down, align_corners=opt.align_corner)
+
+            flows += [flow_ks]
+            flow_ones += [flow_k ]
+            masks += [mask_k]
+            # attns += [mask_k]
+            xfs += [xf_k]
+            flows_down += [flow_k_down]
+            masks_down += [mask_k_down]
+            xfs_warp += [xf_k_warp]
+        '''normalize masks to sum to 1'''
+        mask_cat = torch.cat(masks_down, dim=1)
+        if opt.mask_norm_type == 'softmax':
+            mask_normed = F.softmax(mask_cat, dim=1) # pixel wise sum to 1
+        else:
+            eps = 1e-12
+            mask_normed = mask_cat / (torch.sum(mask_cat, dim=1).unsqueeze(1)+eps) # pixel wise sum to 1
+
+        xfs_warp_masked = None
+        xf_merge = None
+        for k in range(0, opt.K):
+            mask_normed_k_down = mask_normed[:,k:k+1,...]
+
+            if xfs_warp_masked is None:
+                xfs_warp_masked = [xfs_warp[k] * mask_normed_k_down]
+                xf_merge = xfs_warp[k] * mask_normed_k_down
+            else:
+                xfs_warp_masked.append(xfs_warp[k] * mask_normed_k_down)
+                xf_merge += xfs_warp[k] * mask_normed_k_down
+            
+        down_ref_xk = F.interpolate(ref_xs[k], size=flow_k.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+        x_hat_down =  warp_flow(down_ref_xk, flow_k, align_corners=opt.align_corner)
+        x_hat = F.interpolate(x_hat_down, size=ref_xs[k].shape[2:], mode='bilinear', align_corners=opt.align_corner)
+        loss_correct=0
+        for k in range(opt.K):
+            loss_correct += criterionCorrectness(g_x, ref_xs[k], flows[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness)
+            # loss_correct += criterionL1(xfs_warp[k], g_xf)
+        loss_correct = loss_correct/opt.K * opt.lambda_correctness
+        lossG = loss_correct
+        
+        loss_regular = 0
+        if opt.use_flow_reg:
+            for k in range(opt.K):
+                loss_regular += criterionReg(flows[k])
+            
+            loss_regular = loss_regular / opt.K * opt.lambda_flow_reg
+            lossG += loss_regular
+        
+        loss_struct = 0
+        if opt.use_input_mask:
+            for k in range(opt.K):
+                flow_ks = flows[k]
+                for l in range(len(flow_ks)):
+                    flow_kl = flow_ks[l]
+                    ref_m_down = F.interpolate(ref_ms[k], size=flow_kl.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+                    warp_m_down = warp_flow(ref_m_down, flow_kl, align_corners=opt.align_corner)
+                    g_m_down = F.interpolate(g_m, size=flow_kl.shape[2:], mode='bilinear', align_corners=opt.align_corner)
+                    loss_struct += criterionL1(warp_m_down, g_m_down)
+            loss_struct /= opt.K * opt.lambda_struct_correctness
+            lossG += loss_struct
+        
+        epoch_loss_G += lossG.item()
+        epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
+        post_fix_str = 'Epoch_loss=%.3f, G=%.3f, Cor=%.3f'%(epoch_loss_G_moving, lossG.item(), loss_correct.item())
+        if opt.use_input_mask:
+            post_fix_str += ', Reg=%.3f'%loss_regular.item()
+        if opt.use_flow_reg:
+            post_fix_str += ', MaskCorr=%.3f'%loss_struct.item()
+        pbar.set_postfix_str(post_fix_str)
+        
+        lossesG.append(lossG.item())
+        test_name = ''
+        # print(froms)
+        for k in range(opt.K):
+            test_name += str(froms[k][0])+'+'
+        test_name += str(to[0])
+        from PIL import Image
+        from util.vis_util import get_visualize_result
+        if not opt.use_input_mask:   
+            final_img,_,_ = get_visualize_result(opt, ref_xs, ref_ys,None, g_x, g_y,None,None, g_xf, x_hat,\
+                flow_ones, F.interpolate(mask_normed, size=g_x.shape[2:], mode='bilinear',align_corners=opt.align_corner), xfs, xfs_warp, xfs_warp_masked)
+        else:
+            ref_m_down = F.interpolate(ref_ms[0], size=flow_ones[0].shape[2:], mode='bilinear', align_corners=opt.align_corner)
+            m_hat = warp_flow(ref_m_down,flow_ones[0],align_corners=opt.align_corner)
+            final_img,_,_ = get_visualize_result(opt, ref_xs, ref_ys,ref_ms, g_x, g_y,g_m,m_hat, g_xf, x_hat,\
+                flow_ones, F.interpolate(mask_normed, size=g_x.shape[2:], mode='bilinear',align_corners=opt.align_corner), xfs, xfs_warp, xfs_warp_masked)
+        Image.fromarray(final_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
+
+pass
 
 if __name__ == "__main__":
     opt = get_parser()
@@ -969,13 +1358,21 @@ if __name__ == "__main__":
     if opt.phase == 'train':
         today = datetime.today().strftime("%Y%m%d")
         # today = '20201123'
-        experiment_name = '{0}_lsGAN_{1}shot_{2}'.format(opt.id,opt.K, today)
+        # today = '20210106'
+        today = '20210105'
+        # today = '20210104'
+        experiment_name = '{0}_{1}shot_{2}'.format(opt.id,opt.K, today)
         print(experiment_name)
-        train(opt, experiment_name)
-        # train_flow_net(opt, experiment_name)
+        if opt.pretrain_flow:
+            train_flow_net(opt, experiment_name)
+        else:
+            train(opt, experiment_name)
     else:
         with torch.no_grad():
-            test(opt)
+            if opt.pretrain_flow:
+                test_flownet(opt)
+            else:
+                test(opt)
 
 
 

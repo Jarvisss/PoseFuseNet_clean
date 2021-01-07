@@ -1,0 +1,966 @@
+"""multiview generation without direct generation branch
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms.functional as F
+from torch.utils.data import DataLoader
+from datetime import datetime
+import matplotlib
+#matplotlib.use('agg')
+from matplotlib import pyplot as plt
+matplotlib.use('agg')  # for image save not render
+
+# from model.DirectE import DirectEmbedder
+# from model.DirectG import DirectGenerator
+# from model.Parsing_net import ParsingGenerator
+# from model.flow_generator import FlowGenerator, AppearanceEncoder, AppearanceDecoder
+from model.pyramid_flow_generator_with_occlu_attn import FlowGenerator, AppearanceDecoder, AppearanceEncoder, PoseSODecoder
+from model.discriminator import ResDiscriminator
+from model.blocks import warp_flow,_freeze,_unfreeze
+
+from util.vis_util import visualize_feature, visualize_feature_group, visualize_parsing, visualize_Kplus1_attn_result, tensor2im
+from torch.optim.lr_scheduler import MultiStepLR, ReduceLROnPlateau
+
+from dataset.fashion_dataset import FashionDataset
+from loss.loss_generator import PerceptualCorrectness, LossG, MultiAffineRegularizationLoss, FlowAttnLoss
+from loss.externel_functions import AdversarialLoss
+
+from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import numpy as np
+import os
+import pandas as pd
+from skimage.transform import resize
+import torch.nn.functional as F
+import random
+import argparse
+import json
+
+device = torch.device("cuda:0") 
+cpu = torch.device("cpu")
+
+
+def save_parser(opt,fn):
+    with open(fn, 'w') as f:
+        json_obj = vars(opt)
+        # json.dump(json_obj, f, separators=(',\n', ':\n'))
+        json.dump(json_obj, f, indent = 0, separators = (',', ': '))
+
+def set_random_seed(seed):
+    """
+    set random seed
+    """
+    torch.manual_seed(seed) # cpu
+    torch.cuda.manual_seed(seed) #gpu
+    np.random.seed(seed) #numpy
+    random.seed(seed) #random and transforms
+    torch.backends.cudnn.deterministic=True
+
+def get_parser():
+    parser = argparse.ArgumentParser()
+
+    '''Common options'''
+    parser.add_argument('--phase',  type=str,default='train',  help='train|test')
+    parser.add_argument('--id', type=str, default='default', help = 'experiment ID. the experiment dir will be set as "./checkpoint/id/"')
+    parser.add_argument('--seed', type=int, default=7, help = 'random seed')
+    parser.add_argument('--gpu', type=int, default=0, help='gpu id')
+    parser.add_argument('--parallel', action='store_true')
+    parser.add_argument('--batch_size', type=int, default=2, help='batch size')
+    parser.add_argument('--K', type=int, default=2, help='source image views')
+    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+    parser.add_argument('--lr_D',type=float, default=1e-5, help='learning rate of discriminator')
+    parser.add_argument('--root_dir',type=str, default='/home/ljw/playground/poseFuseNet/')
+    parser.add_argument('--path_to_dataset',type=str, default='/home/ljw/playground/Multi-source-Human-Image-Generation/data/fasion-dataset')
+    parser.add_argument('--dataset',type=str, default='fashion', help='danceFashion | iper | fashion')
+    parser.add_argument('--align_corner', action='store_true', help='behaviour in pytorch grid_sample, before torch=1.2.0 is default True, after 1.2.0 is default False')
+
+
+    '''Train options'''
+    parser.add_argument('--epochs', type=int, default=500, help='num epochs')
+    parser.add_argument('--use_scheduler', action='store_true', help='open this to use learning rate scheduler')
+    parser.add_argument('--flow_onfly',action='store_true', help='open this if want to train flow generator end-to-end')
+    parser.add_argument('--flow_exp_name',type=str, default='', help='if pretrain flow, specify this to use it in final train')
+    parser.add_argument('--which_flow_epoch',type=str, default='epoch_latest', help='specify it to use certain epoch checkpoint')
+    parser.add_argument('--anno_size', type=int, nargs=2, help='input annotation size')
+    parser.add_argument('--model_save_freq', type=int, default=2000, help='save model every N iters')
+    parser.add_argument('--img_save_freq', type=int, default=200, help='save image every N iters')
+
+    '''Dataset options'''
+    parser.add_argument('--use_clean_pose', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--use_parsing', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--use_simmap', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--joints_for_cos_sim',type=int, default=-1, help='joints used for cosine sim computation')
+
+    '''Model options'''
+    parser.add_argument('--n_enc', type=int, default=2, help='encoder(decoder) layers ')
+    parser.add_argument('--n_btn', type=int, default=2, help='bottle neck layers in generator')
+    parser.add_argument('--norm_type', type=str, default='in', help='normalization type in network, "in" or "bn"')
+    parser.add_argument('--activation', type=str, default='LeakyReLU', help='"ReLU" or "LeakyReLU"')
+    parser.add_argument('--use_pose_decoder', action='store_true', help='use pose in the target decoder')
+    parser.add_argument('--use_self_attention', action='store_true', help='use sa in the target decoder')
+
+    parser.add_argument('--use_spectral_G', action='store_true', help='open this if use spectral normalization in generator')
+    parser.add_argument('--use_spectral_D', action='store_true', help='open this if use spectral normalization in discriminator')
+
+
+    '''Test options'''
+    # if --test is open
+    parser.add_argument('--test_id', type=str, default='default', help = 'test experiment ID. the experiment dir will be set as "./checkpoint/id/"')
+    parser.add_argument('--test_ckpt_name', type=str, default='model_weights_G', help = 'test checkpoint name.')
+    parser.add_argument('--ref_ids', type=str, default='0', help='test ref ids')
+    parser.add_argument('--test_dataset', type=str, default='danceFashion', help='"danceFashion" or "iper"')
+    parser.add_argument('--test_source', type=str, default='A15Ei5ve9BS', help='a test video in dataset as ref images')
+    parser.add_argument('--test_target_motion', type=str, default='A15Ei5ve9BS', help='a test video in dataset as ref motions')
+    parser.add_argument('--output_all', action='store_true', help='open this to output the full image')
+    parser.add_argument('--test_samples', type=int, default=-1, help='test how many samples, -1 means all')
+
+    '''Experiment options'''
+    parser.add_argument('--use_attn', action='store_true', help='use attention for multi-view parsing generation')
+    parser.add_argument('--mask_sigmoid', action='store_true', help='Use Sigmoid() as mask output layer or not')
+    parser.add_argument('--mask_norm_type', type=str, default='softmax', help='softmax | divsum')
+    parser.add_argument('--use_tps_sim', action='store_true', help='use precomputed tps sim')
+    parser.add_argument('--tps_sim_beta1', type=float, default=5.0, help='use precomputed tps sim')
+    parser.add_argument('--tps_sim_beta2', type=float, default=40.0, help='use precomputed tps sim')
+
+    '''Loss options'''
+    parser.add_argument('--use_adv', action='store_true', help='use adversarial loss in total generation')
+    parser.add_argument('--use_bilinear_correctness', action='store_true', help='use bilinear sampling in sample loss')
+    parser.add_argument('--G_use_resample', action='store_true', help='use gaussian sampling in the target decoder')
+    parser.add_argument('--use_correctness', action='store_true', help='use sample correct loss')
+    parser.add_argument('--use_flow_attn_loss', action='store_true', help='use flow attention loss')
+    parser.add_argument('--use_flow_reg', action='store_true', help='use flow regularization')
+    parser.add_argument('--use_attn_reg', action='store_true', help='use attn regularization')
+
+    parser.add_argument('--lambda_style', type=float, default=500.0, help='style loss')
+    parser.add_argument('--lambda_content', type=float, default=0.5, help='content loss')
+    parser.add_argument('--lambda_rec', type=float, default=5.0, help='L1 loss')
+    parser.add_argument('--lambda_adv', type=float, default=2.0, help='GAN loss weight')
+    parser.add_argument('--lambda_correctness', type=float, default=5.0, help='sample correctness weight')
+    parser.add_argument('--lambda_attn_reg', type=float, default=1.0, help='regular sample loss weight')
+    parser.add_argument('--lambda_flow_reg', type=float, default=0.0025, help='regular sample loss weight')
+    parser.add_argument('--lambda_flow_attn', type=float, default=5.0, help='regular sample loss weight')
+    opt = parser.parse_args()
+    return opt   
+
+
+def create_writer(path_to_log_dir):
+    TIMESTAMP = "/{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
+    writer = SummaryWriter(path_to_log_dir+TIMESTAMP)
+    return writer
+
+def make_ckpt_log_vis_dirs(opt, exp_name):
+    path_to_ckpt_dir = opt.root_dir+ 'checkpoints/{0}/'.format(exp_name)
+    path_to_visualize_dir = opt.root_dir+ 'visualize_result/{0}/'.format(exp_name)
+    path_to_log_dir = opt.root_dir+ 'logs/{0}'.format(exp_name)
+    
+    # path_to_visualize_dir_train = os.path.join(path_to_visualize_dir, 'train')
+    # path_to_visualize_dir_val = os.path.join(path_to_visualize_dir, 'val')
+
+    if not os.path.isdir(path_to_ckpt_dir):
+        os.makedirs(path_to_ckpt_dir)
+    if not os.path.isdir(path_to_visualize_dir):
+        os.makedirs(path_to_visualize_dir)
+    # if not os.path.isdir(path_to_visualize_dir_train):
+    #     os.makedirs(path_to_visualize_dir_train)
+    # if not os.path.isdir(path_to_visualize_dir_val):
+    #     os.makedirs(path_to_visualize_dir_val)
+    if not os.path.isdir(path_to_log_dir):
+        os.makedirs(path_to_log_dir)
+    
+    return path_to_ckpt_dir, path_to_log_dir, path_to_visualize_dir
+
+def init_weights(m, init_type='normal'):
+    if type(m) == nn.Conv2d:
+        if init_type=='xavier':
+            torch.nn.init.xavier_uniform_(m.weight)
+        elif init_type=='normal':
+            torch.nn.init.normal_(m.weight,0,0.02)
+        elif init_type=='kaiming':
+            torch.nn.init.kaiming_normal_(m.weight)
+
+def make_dataset(opt):
+    """Create dataset"""
+    path_to_dataset = opt.path_to_dataset
+    train_tuples_name = 'fasion-pairs-train.csv' if opt.K==1 else 'fasion-%d_tuples-train.csv'%(opt.K+1)
+    test_tuples_name = 'fasion-pairs-test.csv' if opt.K==1 else 'fasion-%d_tuples-test.csv'%(opt.K+1)
+    path_to_train_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/train_sim' if opt.use_tps_sim else None
+    path_to_test_label = '/dataset/ljw/deepfashion/GLFA_split/fashion/test_sim'  if opt.use_tps_sim else None
+
+    if path_to_dataset == '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion':
+        dataset = FashionDataset(
+            phase = opt.phase,
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
+            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train_256/'), 
+            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
+            path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
+            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
+            opt=opt)
+    else: # '/home/ljw/playground/Multi-source-Human-Image-Generation/data/fasion-dataset'
+        dataset = FashionDataset(
+            phase = opt.phase,
+            path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-%d_tuples-train.csv'%(opt.K+1)), 
+            path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-%d_tuples-test.csv'%(opt.K+1)), 
+            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
+            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
+            path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train_new_split.csv'), 
+            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test_new_split.csv'), 
+            opt=opt)
+    return dataset
+
+def make_dataloader(opt, dataset):
+    is_train = opt.phase == 'train'
+    batch_size = 1 if not is_train else opt.batch_size
+    shuffle = is_train
+    drop_last = is_train
+    dataloader = DataLoader(dataset, batch_size, shuffle, num_workers=8, drop_last=drop_last)
+    return dataloader
+
+def save_discriminator(parallel, D, optimizerD, path_to_chkpt_D):
+    D_state_dict = D.state_dict() if not parallel else D.module.state_dict()
+    torch.save({
+        'Dis_state_dict': D_state_dict,
+        'optimizerD': optimizerD.state_dict(),
+    }, path_to_chkpt_D)    
+    pass
+
+def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,path_to_chkpt_G):
+    GE_state_dict = GE.state_dict() if not parallel else GE.module.state_dict()
+    GF_state_dict = GF.state_dict() if not parallel else GF.module.state_dict()
+    GD_state_dict = GD.state_dict() if not parallel else GD.module.state_dict()
+    torch.save({
+        'epoch': epoch,
+        'lossesG': lossesG,
+        'GE_state_dict': GE_state_dict,
+        'GF_state_dict': GF_state_dict,
+        'GD_state_dict': GD_state_dict,
+        'i_batch': i_batch,
+        'optimizerG': optimizerG.state_dict(),
+    }, path_to_chkpt_G)
+
+def init_flowgenerator(opt, path_to_chkpt):
+    image_nc = 3
+    structure_nc = 21
+    if opt.use_parsing:
+        structure_nc += 20
+    if opt.use_simmap:
+        image_nc += 13
+    
+    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= [2,3], ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    if opt.parallel:
+        GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
+    GF = GF.to(device)
+
+    optimizerG = optim.Adam(params = list(GF.parameters()) ,
+                            lr=opt.lr,
+                            amsgrad=False)
+    if not os.path.isfile(path_to_chkpt):
+        # initiate checkpoint if inexist
+        GF.apply(init_weights)
+
+        print('Initiating new flow model checkpoint...')
+        if opt.parallel:
+            torch.save({
+                    'epoch': 0,
+                    'lossesG': [],
+                    'GF_state_dict': GF.module.state_dict(),
+                    'i_batch': 0,
+                    'optimizerG': optimizerG.state_dict(),
+                    }, path_to_chkpt)
+        else:
+            torch.save({
+                    'epoch': 0,
+                    'lossesG': [],
+                    'GF_state_dict': GF.state_dict(),
+                    'i_batch': 0,
+                    'optimizerG': optimizerG.state_dict(),
+                    }, path_to_chkpt)
+        print('...Done')
+
+def init_discriminator(opt, path_to_chkpt):
+    D_inc = 3
+    if opt.parallel:
+        D = nn.DataParallel(ResDiscriminator(input_nc=D_inc,ndf=32, img_f=128,layers=4, use_spect=opt.use_spectral_D).to(device)) # dx + dx + dy = 3 + 20 + 20
+    else:
+        D = ResDiscriminator(input_nc=D_inc,ndf=32,img_f=128,layers=4, use_spect=opt.use_spectral_D).to(device) # dx + dx + dy = 3 + 20 + 20
+
+    optimizerD = optim.Adam(params = list(D.parameters()) ,
+                            lr=opt.lr_D,
+                            amsgrad=False)
+    if not os.path.isfile(path_to_chkpt):
+        # initiate checkpoint if inexist
+        D.apply(init_weights)
+        print('Initiating new Discriminator model checkpoint...')
+        save_discriminator(opt.parallel, D, optimizerD, path_to_chkpt)
+        print('...Done')
+    return D, optimizerD
+
+def init_generator(opt, path_to_chkpt, path_to_flow_chkpt=None):
+    '''doc string
+    '''
+    image_nc = 3
+    structure_nc = 21
+    flow_layers = [2,3]
+    if opt.use_parsing:
+        structure_nc += 20
+    if opt.use_simmap:
+        image_nc += 13
+
+    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    
+    if not opt.use_pose_decoder:
+        GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+            activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+    else:
+        GD = PoseSODecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+            activation=opt.activation, use_spectral_norm=opt.use_spectral_G,use_self_attention=opt.use_self_attention, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+
+    if opt.parallel:
+        GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
+        GE = nn.DataParallel(GE)
+        GD = nn.DataParallel(GD)
+
+    GF = GF.to(device)
+    GE = GE.to(device)
+    GD = GD.to(device)
+
+    optimizerG = optim.Adam(params = list(GF.parameters()) + list(GE.parameters()) + list(GD.parameters()) ,
+                            lr=opt.lr,
+                            amsgrad=False)
+    if opt.use_scheduler:
+        lr_scheduler = ReduceLROnPlateau(optimizerG, 'min', factor=np.sqrt(0.1), patience=5, min_lr=5e-7)
+    
+    if not os.path.isfile(path_to_chkpt):
+        # initiate checkpoint if inexist
+        GF.apply(init_weights)
+        GE.apply(init_weights)
+        GD.apply(init_weights)
+
+        print('Initiating new checkpoint...')
+        if not opt.flow_onfly:
+            if path_to_flow_chkpt is not None:
+                checkpoint_flow = torch.load(path_to_flow_chkpt, map_location=cpu)
+                print('load flow from existing checkpoint, epoch: {0},batch: {1}'.format(checkpoint_flow['epoch'],checkpoint_flow['i_batch']))
+                if opt.parallel:
+                    GF.module.load_state_dict(checkpoint_flow['GF_state_dict'], strict=False)
+                else:
+                    GF.load_state_dict(checkpoint_flow['GF_state_dict'], strict=False)
+
+            else:
+                print('Please specify the pretrained flow model path')
+        
+        save_generator(opt.parallel, 0, [],GE, GF, GD, 0, optimizerG, path_to_chkpt)
+        print('...Done')
+
+    return GF, GE, GD, optimizerG
+
+def train_flow_net(opt, exp_name):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
+    
+    '''Set logging,checkpoint,vis dir'''
+    path_to_ckpt_dir, path_to_log_dir, path_to_visualize_dir = make_ckpt_log_vis_dirs(opt, exp_name)
+    path_to_chkpt = path_to_ckpt_dir + 'flow_model_weights.tar' 
+
+    '''save parser'''
+    save_parser(opt, path_to_ckpt_dir+'config.json')
+    
+    '''Create dataset and dataloader'''
+    dataset = make_dataset(opt)
+    dataloader = make_dataloader(opt, dataset)
+
+    '''Create Model'''
+    GF, optimizerG = init_flowgenerator(opt, path_to_chkpt)
+    
+    '''Loading from past checkpoint'''
+    checkpoint = torch.load(path_to_chkpt, map_location=cpu)
+    if opt.parallel:
+        GF.module.load_state_dict(checkpoint['GF_state_dict'], strict=False)
+    else:
+        GF.load_state_dict(checkpoint['GF_state_dict'], strict=False)
+    epochCurrent = checkpoint['epoch']
+    lossesG = checkpoint['lossesG']
+    i_batch_current = checkpoint['i_batch']
+    i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
+    optimizerG.load_state_dict(checkpoint['optimizerG'])
+    
+
+    '''create tensorboard writter'''
+    writer = create_writer(path_to_log_dir)
+    
+    '''Losses'''
+    criterionG = LossG(device=device)
+    criterionCorrectness = PerceptualCorrectness().to(device)
+
+    """ Training start """
+    for epoch in range(epochCurrent, opt.epochs):
+        if epoch > epochCurrent:
+            i_batch_current = 0
+        epoch_loss_G = 0
+        pbar = tqdm(dataloader, leave=True, initial=0)
+        pbar.set_description('[{0:>4}/{1:>4}], lr-{2}'.format(epoch,opt.epochs,optimizerG.param_groups[0]['lr']))
+        
+        for i_batch, batch_data in enumerate(pbar, start=0):
+            ref_xs = batch_data['ref_xs']
+            ref_ys = batch_data['ref_ys']
+            g_x = batch_data['g_x']
+            g_y = batch_data['g_y']
+            assert(len(ref_xs)==len(ref_ys))
+            assert(len(ref_xs)==opt.K)
+            for i in range(len(ref_xs)):
+                ref_xs[i] = ref_xs[i].to(device)
+                ref_ys[i] = ref_ys[i].to(device)
+
+            g_x = g_x.to(device) # [B, 3, 256, 256]
+            g_y = g_y.to(device) # [B, 20, 256, 256]
+            
+            flows, masks, xfs = [], [], []
+            flows_down,masks_down, xfs_warp = [], [], []
+            for k in range(0, opt.K):
+                flow_k, mask_k = GF(ref_xs[k], ref_ys[k], g_y)
+                xf_k = GE(ref_xs[k])
+                flow_k_down = F.interpolate(flow_k * (xf_k.shape[2]-1) / (flow_k.shape[2]-1), size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
+                mask_k_down = F.interpolate(mask_k, size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
+                xf_k_warp = warp_flow(xf_k, flow_k_down, align_corners=opt.align_corner)
+
+                flows += [flow_k]
+                masks += [mask_k]
+                xfs += [xf_k]
+                flows_down += [flow_k_down]
+                masks_down += [mask_k_down]
+                xfs_warp += [xf_k_warp]
+            
+            '''normalize masks to sum to 1'''
+            mask_cat = torch.cat(masks_down, dim=1)
+            if opt.mask_norm_type == 'softmax':
+                mask_normed = F.softmax(mask_cat, dim=1) # pixel wise sum to 1
+            else:
+                eps = 1e-12
+                mask_normed = mask_cat / (torch.sum(mask_cat, dim=1).unsqueeze(1)+eps) # pixel wise sum to 1
+
+            xfs_warp_masked = None
+            xf_merge = None
+            for k in range(0, opt.K):
+                mask_normed_k_down = mask_normed[:,k:k+1,...]
+
+                if xfs_warp_masked is None:
+                    xfs_warp_masked = [xfs_warp[k] * mask_normed_k_down]
+                    xf_merge = xfs_warp[k] * mask_normed_k_down
+                else:
+                    xfs_warp_masked.append(xfs_warp[k] * mask_normed_k_down)
+                    xf_merge += xfs_warp[k] * mask_normed_k_down
+
+            x_hat = GD(xf_merge)
+
+            lossG_content, lossG_style, lossG_L1 = criterionG(g_x, x_hat)
+
+            lossG_content = lossG_content * opt.lambda_content
+            lossG_style = lossG_style * opt.lambda_style
+            lossG_L1 = lossG_L1 * opt.lambda_rec
+
+            writer.add_scalar('{0}/lossG_content'.format(opt.phase), lossG_content.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/lossG_style'.format(opt.phase), lossG_style.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/lossG_L1'.format(opt.phase), lossG_L1.item(), global_step=i_batch_total, walltime=None)
+            lossG = lossG_content + lossG_style + lossG_L1
+
+            optimizerG.zero_grad()
+            lossG.backward(retain_graph=False)
+            optimizerG.step()
+            epoch_loss_G += lossG.item()
+            epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
+            i_batch_total += 1
+            
+            post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
+
+            pbar.set_postfix_str(post_fix_str)
+            if opt.use_scheduler:
+                lr_scheduler.step(epoch_loss_G_moving)
+            lossesG.append(lossG.item())
+            
+            if i_batch * opt.batch_size % opt.model_save_freq == 0:
+                final_img,_,_ = get_visualize_result(opt, ref_xs, ref_ys,None, g_x, g_y,None,None, xf_merge, x_hat,\
+                    flows, F.interpolate(mask_normed, size=g_x.shape[2:], mode='bilinear',align_corners=opt.align_corner), xfs, xfs_warp, xfs_warp_masked)
+                
+                plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
+     
+def train(opt, exp_name):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
+    
+    '''Set logging,checkpoint,vis dir'''
+    path_to_ckpt_dir, path_to_log_dir, path_to_visualize_dir = make_ckpt_log_vis_dirs(opt, exp_name)
+    path_to_chkpt_G = path_to_ckpt_dir + 'model_weights_G.tar' 
+    path_to_chkpt_D = path_to_ckpt_dir + 'model_weights_D.tar' 
+
+    path_to_chkpt_flow = None
+    if not opt.flow_onfly:
+        path_to_chkpt_flow = opt.root_dir+ 'checkpoints/{0}/{1}.tar'.format(opt.flow_exp_name, opt.which_flow_epoch)
+
+    '''save parser'''
+    save_parser(opt, path_to_ckpt_dir+'config.json')
+    
+    '''Create dataset and dataloader'''
+    print('-------Loading Dataset--------')
+    dataset = make_dataset(opt)
+    dataloader = make_dataloader(opt, dataset)
+
+    print('-------Creating Model--------')
+    '''Create Model'''
+    GF, GE, GD, optimizerG = init_generator(opt, path_to_chkpt_G, path_to_chkpt_flow)
+    
+    '''Loading from past checkpoint_G'''
+    checkpoint_G = torch.load(path_to_chkpt_G, map_location=cpu)
+    if opt.parallel:
+        GF.module.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
+        GE.module.load_state_dict(checkpoint_G['GE_state_dict'], strict=False)
+        GD.module.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
+    else:
+        GF.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
+        GE.load_state_dict(checkpoint_G['GE_state_dict'], strict=False)
+        GD.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
+    epochCurrent = checkpoint_G['epoch']
+    lossesG = checkpoint_G['lossesG']
+    i_batch_current = checkpoint_G['i_batch']
+    i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
+    optimizerG.load_state_dict(checkpoint_G['optimizerG'])
+    GF.train()
+    GE.train()
+    GD.train()
+
+    if opt.use_adv:
+        D, optimizerD = init_discriminator(opt, path_to_chkpt_D)
+        checkpoint_D = torch.load(path_to_chkpt_D, map_location=cpu)
+        optimizerD.load_state_dict(checkpoint_D['optimizerD'])
+        if opt.parallel:
+            D.module.load_state_dict(checkpoint_D['Dis_state_dict'], strict=False)
+        else:
+            D.load_state_dict(checkpoint_D['Dis_state_dict'], strict=False)
+        D.train()
+
+
+    '''create tensorboard writter'''
+    writer = create_writer(path_to_log_dir)
+    
+    '''Losses'''
+    criterionG = LossG(device=device)
+    criterion_GAN = AdversarialLoss(type='lsgan').to(device)
+    criterionCorrectness = PerceptualCorrectness().to(device)
+    criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+    criterionFlowAttn = FlowAttnLoss().to(device)
+
+    print('-------Training Start--------')
+    """ Training start """
+    for epoch in range(epochCurrent, opt.epochs):
+        if epoch > epochCurrent:
+            i_batch_current = 0
+        epoch_loss_G = 0
+        pbar = tqdm(dataloader, leave=True, initial=0)
+        pbar.set_description('[{0:>4}/{1:>4}], G_lr-{2},D_lr-{3}'.format(epoch,opt.epochs,optimizerG.param_groups[0]['lr'],optimizerD.param_groups[0]['lr']))
+        
+        for i_batch, batch_data in enumerate(pbar, start=0):
+            ref_xs = batch_data['ref_xs']
+            ref_ys = batch_data['ref_ys']
+            g_x = batch_data['g_x']
+            g_y = batch_data['g_y']
+            if opt.use_flow_attn_loss or opt.use_attn_reg:
+                sims = batch_data['sim']
+                assert(len(sims)==opt.K)
+                for i in range(opt.K):
+                    sims[i] = sims[i].to(device)
+                    
+            assert(len(ref_xs)==len(ref_ys))
+            assert(len(ref_xs)==opt.K)
+            for i in range(len(ref_xs)):
+                ref_xs[i] = ref_xs[i].to(device)
+                ref_ys[i] = ref_ys[i].to(device)
+                
+
+            g_x = g_x.to(device) # [B, 3, 256, 256]
+            g_y = g_y.to(device) # [B, 20, 256, 256]
+            
+            flows, attns,  xfs = [], [], []
+            flows_down,masks_down, xfs_warp = [], [], []
+
+            # flows: K *[tensor[2,32,32] tensor[2,64,64]]
+            # masks: K *[tensor[1,32,32] tensor[1,64,64]]
+            # xfs: K *[tensor[256,32,32] tensor[128,64,64]]
+            with torch.no_grad():
+                gf = GE(g_x)[0:2]
+            for k in range(0, opt.K):
+                # get 2 flows, masks and attns at two resolution 32, 64
+
+                flow_ks, _, attn_ks = GF(ref_xs[k], ref_ys[k], g_y)
+                
+                # get 2 source features at resolution 32, 64
+                xf_ks = GE(ref_xs[k])[0:2]
+                flows += [flow_ks]
+                attns += [attn_ks]
+                xfs += [xf_ks]
+
+            ### GD input is:
+            # flows: K * [B,2,32,32][B,2,64,64]
+            # masks: K * [B,1,32,32][B,1,64,64]
+            # source_features: K * [B,256,32,32][B,128,64,64]
+            if opt.use_pose_decoder:
+                # attn_normed: [K+1,32,32] [K+1,64,64]
+                # pose_outs: [256,32,32] [128,64,64]
+                x_hat, attn_normed, pose_outs = GD(g_y, xfs, flows, attns)
+            else:
+                x_hat = GD(xfs, flows, masks, attn_norm_trans)
+
+            if opt.use_adv:
+                # Discriminator backward
+                optimizerD.zero_grad()
+                _unfreeze(D)
+                D_real = D(g_x)
+                D_fake = D(x_hat.detach())
+                D_real_loss = criterion_GAN(D_real, True)
+                D_fake_loss = criterion_GAN(D_fake, False)
+
+                lossD = (D_real_loss + D_fake_loss) * 0.5
+                writer.add_scalar('{0}/lossD'.format(opt.phase), lossD.item(), global_step=i_batch_total, walltime=None)
+
+                lossD.backward()
+                optimizerD.step()
+
+            # Generator backward
+            optimizerG.zero_grad()
+            
+
+            lossG_content, lossG_style, lossG_L1 = criterionG(g_x, x_hat)
+            
+            lossG_content = lossG_content * opt.lambda_content
+            lossG_style = lossG_style * opt.lambda_style
+            lossG_L1 = lossG_L1 * opt.lambda_rec
+             
+            writer.add_scalar('{0}/lossG_content'.format(opt.phase), lossG_content.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/lossG_style'.format(opt.phase), lossG_style.item(), global_step=i_batch_total, walltime=None)
+            writer.add_scalar('{0}/lossG_L1'.format(opt.phase), lossG_L1.item(), global_step=i_batch_total, walltime=None)
+            lossG = lossG_content + lossG_style + lossG_L1
+            if opt.use_adv:
+                _freeze(D)
+                D_fake = D(x_hat)
+                lossG_adv = criterion_GAN(D_fake, True) * opt.lambda_adv
+                writer.add_scalar('{0}/lossG_adv'.format(opt.phase), lossG_adv.item(), global_step=i_batch_total, walltime=None)
+                lossG = lossG + lossG_adv
+            
+            if opt.use_correctness:
+                loss_correct=0
+                for k in range(opt.K):
+                    loss_correct += criterionCorrectness(g_x, ref_xs[k], flows[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness)
+                    # loss_correct += criterionL1(xfs_warp[k], g_xf)
+                loss_correct = loss_correct/opt.K * opt.lambda_correctness
+                writer.add_scalar('{0}/lossG_correct'.format(opt.phase), loss_correct.item(), global_step=i_batch_total, walltime=None)
+                lossG = lossG + loss_correct
+
+            if opt.use_flow_attn_loss:
+                loss_flow_attn = 0 #  sum_i(w_i(P_G-P_i)), wi = exp(-attn)
+                sim = []
+                max_index= 0 # for 
+                max_value= -1
+                for k in range(0, opt.K):
+                    tt = []
+                    value = torch.mean(sims[k])
+                    for i in range(0, len(attns[k])):
+                        b,c,h,w = flows[k][i].shape
+                        down_sim = F.interpolate(sims[k], size=(h,w), mode='bilinear',align_corners=opt.align_corner)
+                        # temp = torch.ones_like(attns[k][i]) * down_sim
+                        tt+=[down_sim]
+                    sim += [tt]
+                    if max_value < value:
+                        max_index = k
+                # for k in range(0, opt.K):
+                #     loss_flow_attn += criterionFlowAttn(g_x, ref_xs[k], flows[k], sim[k], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness) #  
+                loss_flow_attn = criterionFlowAttn(g_x, ref_xs[max_index], flows[max_index], sim[max_index], used_layers=[2, 3], use_bilinear_sampling=opt.use_bilinear_correctness) #  
+
+                loss_flow_attn = loss_flow_attn * opt.lambda_flow_attn
+                # loss_flow_attn = loss_flow_attn / opt.K * opt.lambda_flow_attn
+
+                lossG += loss_flow_attn
+                writer.add_scalar('{0}/loss_flow_attn'.format(opt.phase), loss_flow_attn.item(), global_step=i_batch_total, walltime=None)
+
+            if opt.use_attn_reg:
+                loss_attn_reg = 0 #  sum(attn_i * sim_i)/2 + attn_GD /2 (sum(attn_i,attn_GD)==1, sum(sim_i)==1)
+                
+                for i in range(0, len(attns[k])):
+                    b,c,h,w = flows[0][i].shape
+                    for k in range(0, opt.K):
+                        down_sim = F.interpolate(sims[k], size=(h,w), mode='bilinear',align_corners=opt.align_corner)
+                        loss_attn_reg += torch.mean(attn_normed[i][:,k+1:k+2,...] * (1-down_sim) * opt.K / (opt.K+1))
+                    loss_attn_reg += torch.mean(attn_normed[i][:,0:1,...] /(opt.K+1))
+                loss_attn_reg = loss_attn_reg / opt.K * opt.lambda_attn_reg
+                lossG += loss_attn_reg
+                writer.add_scalar('{0}/loss_attn_reg'.format(opt.phase), loss_attn_reg.item(), global_step=i_batch_total, walltime=None)
+
+
+            if opt.use_flow_reg:
+                loss_regular=0
+                for k in range(opt.K):
+                    loss_regular += criterionReg(flows[k])
+                
+                loss_regular = loss_regular / opt.K * opt.lambda_flow_reg
+            
+                lossG += loss_regular
+                writer.add_scalar('{0}/loss_regular'.format(opt.phase), loss_regular.item(), global_step=i_batch_total, walltime=None)
+
+
+            lossG.backward(retain_graph=False)
+            optimizerG.step()
+            epoch_loss_G += lossG.item()
+            epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
+            i_batch_total += 1
+            
+            post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
+            if opt.use_adv:
+                post_fix_str += ', G_adv=%.3f, D_loss=%.3f'%(lossG_adv.item(), lossD.item())
+            if opt.use_correctness:
+                post_fix_str += ', G_cor=%.3f'%(loss_correct.item())
+            if opt.use_flow_reg:
+                post_fix_str += ', G_reg=%.3f'%(loss_regular.item())
+            if opt.use_flow_attn_loss:
+                post_fix_str += ', G_flo=%.3f'%(loss_flow_attn.item())
+            
+            pbar.set_postfix_str(post_fix_str)
+            if opt.use_scheduler:
+                lr_scheduler.step(epoch_loss_G_moving)
+            lossesG.append(lossG.item())
+            
+            if i_batch % opt.img_save_freq == 0:
+                final_img,_,_ = visualize_Kplus1_attn_result(opt, ref_xs, ref_ys,None, g_x, x_hat, g_y,None,None,\
+                    flows, attn_normed, pose_outs, xfs, gf)
+                if opt.use_flow_attn_loss or opt.use_attn_reg:
+                    if not opt.use_tps_sim:
+                        sim0=tensor2im(sims[0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                        sim1=tensor2im(sims[1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                        final_img[256*2:256*3, -2*256:-256] = sim0
+                        final_img[256*2:256*3, -256:] = sim1
+                    else:
+                        sim00=tensor2im(sim[0][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                        sim10=tensor2im(sim[1][0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                        sim01=tensor2im(sim[0][1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                        sim11=tensor2im(sim[1][1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+                        final_img[256*2:256*3, -2*256:-256] = sim00
+                        final_img[256*2:256*3, -256:] = sim10
+                        final_img[256*3:256*4, -2*256:-256] = sim01
+                        final_img[256*3:256*4, -256:] = sim11
+                    
+                plt.imsave(os.path.join(path_to_visualize_dir,"epoch_{}_batch_{}.png".format(epoch, i_batch)), final_img)
+
+            if i_batch % opt.model_save_freq == 0:
+                path_to_save_G = path_to_ckpt_dir + 'epoch_{}_batch_{}_G.tar'.format(epoch, i_batch)
+                path_to_save_D = path_to_ckpt_dir + 'epoch_{}_batch_{}_D.tar'.format(epoch, i_batch)
+                save_generator(opt.parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG, path_to_save_G)
+                save_discriminator(opt.parallel, D, optimizerD, path_to_save_D) 
+        
+        save_generator(opt.parallel, epoch+1, lossesG, GE, GF, GD, i_batch, optimizerG, path_to_chkpt_G)
+        save_discriminator(opt.parallel, D, optimizerD, path_to_chkpt_D)
+        '''save image result'''
+        final_img,_,_ = visualize_Kplus1_attn_result(opt, ref_xs, ref_ys,None, g_x,x_hat, g_y,None,None, \
+                    flows, attn_normed, pose_outs, xfs, gf)
+
+        plt.imsave(os.path.join(path_to_visualize_dir,"epoch_latest.png"), final_img)
+        
+            
+    writer.close()
+
+
+def test(opt):
+    from util.io import load_image, load_skeleton, load_parsing, transform_image
+    import time
+    
+
+    print('-----------TESTING-----------')
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
+    experiment_name = opt.test_id
+    
+    '''Set logging,checkpoint,vis dir'''
+    path_to_ckpt_dir = opt.root_dir+ 'checkpoints/{0}/'.format(experiment_name)
+    
+    path_to_chkpt_G = path_to_ckpt_dir + '{0}.tar'.format(opt.test_ckpt_name) 
+    test_result_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    test_result_eval_dir = '/home/ljw/playground/poseFuseNet/test_result/{0}/{1}/{2}_shot_eval/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+    if not os.path.isdir(test_result_dir):
+        os.makedirs(test_result_dir)
+    if not os.path.isdir(test_result_eval_dir):
+        os.makedirs(test_result_eval_dir)
+    '''save parser'''
+    
+    '''Create dataset and dataloader'''
+    dataset = make_dataset(opt)
+    dataloader = make_dataloader(opt, dataset)
+
+    '''Create Model'''
+    image_nc = 3
+    structure_nc = 21
+    flow_layers = [2,3]
+    if opt.use_parsing:
+        structure_nc += 20
+    if opt.use_simmap:
+        image_nc += 13
+
+    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    if not opt.use_pose_decoder:
+        GD = AppearanceDecoder(n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+            activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+    else:
+        GD = PoseSODecoder(structure_nc=21, n_decode_layers=3, output_nc=3, flow_layers=flow_layers, ngf=64, max_nc=256, norm_type=opt.norm_type,
+            activation=opt.activation, use_spectral_norm=opt.use_spectral_G, align_corners=opt.align_corner, use_resample=opt.G_use_resample)
+    
+    if opt.parallel:
+        GF = nn.DataParallel(GF) # dx + dx + dy = 3 + 20 + 20
+        GE = nn.DataParallel(GE)
+        GD = nn.DataParallel(GD)
+
+    GF = GF.to(device)
+    GE = GE.to(device)
+    GD = GD.to(device)
+    
+    '''Loading from past checkpoint_G'''
+    checkpoint_G = torch.load(path_to_chkpt_G, map_location=cpu)
+    if opt.parallel:
+        GF.module.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
+        GE.module.load_state_dict(checkpoint_G['GE_state_dict'], strict=False)
+        GD.module.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
+    else:
+        GF.load_state_dict(checkpoint_G['GF_state_dict'], strict=False)
+        GE.load_state_dict(checkpoint_G['GE_state_dict'], strict=False)
+        GD.load_state_dict(checkpoint_G['GD_state_dict'], strict=False)
+    epochCurrent = checkpoint_G['epoch']
+    GF.eval()
+    GE.eval()
+    GD.eval()
+
+    '''Losses'''
+    criterionG = LossG(device=device)
+    criterion_GAN = AdversarialLoss(type='lsgan').to(device)
+    criterionCorrectness = PerceptualCorrectness().to(device)
+    criterionReg = MultiAffineRegularizationLoss(kz_dic={2:5, 3:3}).to(device)
+
+    """ Test start """
+    epoch_loss_G = 0
+    pbar = tqdm(dataloader, leave=True, initial=0)
+    num_test_samples = opt.test_samples if opt.test_samples > 0 else len(dataloader)
+    print('test samples: ',num_test_samples)
+    for i_batch, batch_data in enumerate(pbar, start=0):
+        if i_batch == num_test_samples:
+            break
+        model_G_start = time.time()
+        froms = batch_data['froms']
+        to = batch_data['to']
+        ref_xs = batch_data['ref_xs']
+        ref_ys = batch_data['ref_ys']
+        g_x = batch_data['g_x']
+        g_y = batch_data['g_y']
+        sims = batch_data['sim']
+        assert(len(sims)==opt.K)
+        for i in range(opt.K):
+            sims[i] = sims[i].to(device)
+        assert(len(ref_xs)==len(ref_ys))
+        assert(len(ref_xs)==opt.K)
+        for i in range(len(ref_xs)):
+            ref_xs[i] = ref_xs[i].to(device)
+            ref_ys[i] = ref_ys[i].to(device)
+
+        g_x = g_x.to(device) # [B, 3, 256, 256]
+        g_y = g_y.to(device) # [B, 20, 256, 256]
+        
+        flows, attns,  xfs = [], [], []
+        flows_down,masks_down, xfs_warp = [], [], []
+
+        # flows: K *[tensor[2,32,32] tensor[2,64,64]]
+        # masks: K *[tensor[1,32,32] tensor[1,64,64]]
+        # xfs: K *[tensor[256,32,32] tensor[128,64,64]]
+        with torch.no_grad():
+            gf = GE(g_x)[0:2]
+        
+        
+        for k in range(0, opt.K):
+            # get 2 flows and masks at two resolution 32, 64
+            flow_ks, _, attn_ks = GF(ref_xs[k], ref_ys[k], g_y)
+
+            
+            # get 2 source features at resolution 32, 64
+            xf_ks = GE(ref_xs[k])[0:2]
+
+            flows += [flow_ks]
+            attns += [attn_ks]
+            xfs += [xf_ks]
+        
+        
+
+        ### GD input is:
+        # flows: K * [B,2,32,32][B,2,64,64]
+        # masks: K * [B,1,32,32][B,1,64,64]
+        # source_features: K * [B,256,32,32][B,128,64,64]
+        if opt.use_pose_decoder:
+            x_hat, attn_normed, pose_outs = GD(g_y, xfs, flows, attns)
+        else:
+            x_hat = GD(xfs, flows, masks, attn_norm_trans)
+        model_G_end = time.time()
+        # print('model G time:%.3f'%(model_G_end-model_G_start))
+        lossG_content, lossG_style, lossG_L1 = criterionG(g_x, x_hat)
+            
+        lossG_content = lossG_content * opt.lambda_content
+        lossG_style = lossG_style * opt.lambda_style
+        lossG_L1 = lossG_L1 * opt.lambda_rec
+        lossG = lossG_content + lossG_style + lossG_L1
+
+        epoch_loss_G += lossG.item()
+        epoch_loss_G_moving = epoch_loss_G / (i_batch+1)
+        
+        post_fix_str = 'Epoch_loss=%.3f, G=%.3f,L1=%.3f,L_content=%.3f,L_sytle=%.3f'%(epoch_loss_G_moving, lossG.item(), lossG_L1.item(), lossG_content.item(), lossG_style.item())
+        
+        pbar.set_postfix_str(post_fix_str)
+        visual_start = time.time()
+
+        full_img,simp_img, out_img = visualize_Kplus1_attn_result(opt, \
+                    ref_xs=ref_xs, ref_ys=ref_ys,ref_ps=None, gx=g_x, x_hat=x_hat, gy=g_y,\
+                        gp=None,gp_hat=None,flows=flows, attn_normed=attn_normed,generate_features=pose_outs, ref_features=xfs, g_features=gf)
+        sim0=tensor2im(sims[0], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+        sim1=tensor2im(sims[1], 0, is_mask=True).type(torch.uint8).to(cpu).numpy()
+        full_img[256*2:256*3, -2*256:-256] = sim0
+        full_img[256*2:256*3, -256:] = sim1
+        visual_end = time.time()
+        # print('visual time:%.3f'%(visual_end-visual_start))
+        
+        save_start = time.time()
+        test_name = ''
+        # print(froms)
+        for k in range(opt.K):
+            test_name += str(froms[k][0])+'+'
+        test_name += str(to[0])
+        from PIL import Image
+        Image.fromarray(out_img).save(os.path.join(test_result_eval_dir,"{0}_vis.jpg".format(test_name)))
+        Image.fromarray(simp_img).save(os.path.join(test_result_dir,"{0}_simp.jpg".format(test_name)))
+        if opt.output_all:
+            Image.fromarray(full_img).save(os.path.join(test_result_dir,"{0}_all.jpg".format(test_name)))
+        save_end = time.time()
+        # print('save time:%.3f'%(save_end-save_start))
+        
+    pass
+
+
+if __name__ == "__main__":
+    opt = get_parser()
+    for k,v in sorted(vars(opt).items()):
+        print(k,':',v)
+    set_random_seed(opt.seed)
+    
+    if opt.phase == 'train':
+        today = datetime.today().strftime("%Y%m%d")
+        # today = '20201123'
+        experiment_name = '{0}_{1}shot_{2}'.format(opt.id,opt.K, today)
+        print(experiment_name)
+        train(opt, experiment_name)
+        # train_flow_net(opt, experiment_name)
+    else:
+        with torch.no_grad():
+            test(opt)
+
+
+
+

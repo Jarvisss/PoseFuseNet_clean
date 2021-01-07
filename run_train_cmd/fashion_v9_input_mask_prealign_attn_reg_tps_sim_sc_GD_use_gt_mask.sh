@@ -1,0 +1,31 @@
+cd ..
+python run_fashion_pyramid_occ+attn.py \
+ --id=fashion_v9_input_mask_prealign_attn_reg_tps_sim_sc_test \
+ --K=2 \
+ --gpu=0\
+ --phase 'train'\
+ --align_corner\
+ --batch_size 5 \
+ --lr 1e-4 \
+ --lr_D 1e-5 \
+ --use_adv \
+ --use_spectral_D \
+ --path_to_dataset '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion'\
+ --anno_size 256 176 \
+ --use_correctness \
+ --align_input\
+ --use_attn_reg\
+ --use_flow_reg\
+ --use_flow_attn_loss\
+ --use_input_mask\
+ --GD_use_gt_mask\
+ --use_pose_decoder \
+ --lambda_flow_reg 0.0025\
+ --lambda_attn_reg 1\
+ --lambda_flow_attn 0.01\
+ --lambda_struct_correctness 10\
+ --use_tps_sim\
+ --use_label_field_tps\
+ --model_save_freq 5000 \
+ --flow_exp_name 'fashion_pretrain_flow_input_mask_align_input_1shot_20210102'\
+ --which_flow_epoch 'epoch_22_batch_5000_G'

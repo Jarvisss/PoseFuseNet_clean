@@ -24,6 +24,27 @@ COLORS = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0]
           [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255],
           [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
 
+KEYPOINT_MAP = {
+    'NOSE':0,
+    'NECK':1,
+    'LSHO':2,
+    'LELBO':3,
+    'LHAND':4,
+    'RSHO':5,
+    'RELBO':6,
+    'RHAND':7,
+    'LHIP':8,
+    'LKNEE':9,
+    'LANKL':10,
+    'RHIP':11,
+    'RKNEE':12,
+    'RANKL':13,
+    'LEYE':14,
+    'LEAR':15,
+    'REYE':16,
+    'REAR':17
+}
+
 def labelcolormap(N):
     if N == 18: # CelebAMask-HQ
         cmap = np.array([[255, 0, 0],   [255, 85, 0], [255, 170, 0], [255, 255, 0], 
@@ -175,21 +196,27 @@ def draw_legend():
 def get_scale_trans(source_kp:np.ndarray, target_kp:np.ndarray):
 
     '''
+    @source_kp [2,18] in x,y order
+    @target_kp [2,18] in x,y order
     get scale and translation from source to target keypoint,
-    use 4 points to compute
+    use 4 points to compute,
+    scale is the delta_y scale
+    trans is the 
     '''
     KP = [2,5,8,11] # rs, ls, rh, lh
+    KP_shoulders = [2,5]
+    KP_hips = [8,11]
     source_central = np.average(source_kp[:,KP],axis=1)
     target_central = np.average(target_kp[:,KP],axis=1)
-    source_lenth = np.average(np.linalg.norm((source_kp[:,KP] - source_central[:,np.newaxis]),axis=0))
-    target_lenth = np.average(np.linalg.norm((target_kp[:,KP] - target_central[:,np.newaxis]),axis=0))
-    scale = target_lenth / (source_lenth + np.finfo(float).eps)
+    source_delta_y = np.mean((source_kp[:,KP_shoulders] - source_kp[:,KP_hips])[1,:])
+    target_delta_y = np.mean((target_kp[:,KP_shoulders] - target_kp[:,KP_hips])[1,:])
+    scale = target_delta_y / (source_delta_y + np.finfo(float).eps)
 
     # print('scale: ',scale)
 
-    center = np.array([(175+0)/2, (256+0)/2]) # the center of image
-    
-    trans = (target_kp[:,1] - center)/scale + center - source_kp[:,1]
+    center = np.array([(175+0)/2, (255+0)/2]) # the center of image
+    # trans = (target_kp[:,1] - center)/scale + center - source_kp[:,1]
+    trans = target_kp[:,1] - (source_kp[:,1] - center)*scale - center
     # print('trans: ',trans)
     return scale, trans
 
@@ -206,6 +233,32 @@ def get_dot_sim(source:np.ndarray, target:np.ndarray, norm_value:float, beta1:fl
     flow_term = source[:,:,:2] * target[:,:,:2]
     flow_term = (np.sum(flow_term, axis=2)+1)/2 # H,W
     return flow_term,label_term,flow_term*label_term
+
+def getDirection(keypoints:np.ndarray):
+    '''
+    @ keypoints: [2,18] ndarray, [y,x] order
+    Judge if person is facing front or back
+    '''
+    rsho = keypoints[:,KEYPOINT_MAP['RSHO']]
+    lsho = keypoints[:,KEYPOINT_MAP['LSHO']]
+    rhip = keypoints[:,KEYPOINT_MAP['RHIP']]
+    lhip = keypoints[:,KEYPOINT_MAP['LHIP']]
+    assert rsho[0]!=-1
+    assert rsho[1]!=-1
+    assert lsho[0]!=-1
+    assert lsho[1]!=-1
+    assert rhip[0]!=-1
+    assert rhip[1]!=-1
+    assert lhip[0]!=-1
+    assert lhip[1]!=-1
+
+    sho_dir = rsho - lsho
+    hip_dir = rhip - lhip
+    
+    if (sho_dir + hip_dir)[1] > 0:
+        return 1
+    else:
+        return -1
 
 if __name__ == "__main__":
     import pandas as pd
@@ -296,3 +349,5 @@ if __name__ == "__main__":
     # plt.imsave('aa.png',colors)
     # plt.show()
     # print(mask.shape)
+
+    
