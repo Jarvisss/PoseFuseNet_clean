@@ -175,8 +175,8 @@ def make_dataset(opt):
             phase = opt.phase,
             path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-train.csv'), 
             path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-test.csv'), 
-            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
-            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
+            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train_256/'), 
+            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
             opt=opt)
@@ -185,8 +185,8 @@ def make_dataset(opt):
             phase = opt.phase,
             path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-train.csv'), 
             path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-4_tuples-test.csv'), 
-            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
-            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
+            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train_256/'), 
+            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train_new_split.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test_new_split.csv'), 
             opt=opt)

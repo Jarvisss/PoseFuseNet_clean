@@ -1,6 +1,6 @@
 cd ..
 python run_mask_net.py \
- --id=fashion_pretrain_masknet \
+ --id=fashion_pretrain_masknet_softmax \
  --K=2 \
  --gpu=0\
  --phase 'train'\

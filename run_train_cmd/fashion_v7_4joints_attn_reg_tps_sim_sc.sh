@@ -1,8 +1,8 @@
 cd ..
 python run_fashion_pyramid_occ+attn.py \
- --id=fashion_v7_4joints_sc_attn_reg_tps_sim \
- --K=2 \
- --gpu=0\
+ --id=fashion_v7_sc_attn_reg_in_mask_tps_sim \
+ --K=3 \
+ --gpu=2\
  --phase 'train'\
  --align_corner\
  --batch_size 4 \
@@ -15,6 +15,7 @@ python run_fashion_pyramid_occ+attn.py \
  --use_correctness \
  --use_flow_reg\
  --use_pose_decoder \
+ --use_bone_RGB \
  --lambda_flow_reg 0.0025\
  --use_attn_reg\
  --lambda_attn_reg 1\

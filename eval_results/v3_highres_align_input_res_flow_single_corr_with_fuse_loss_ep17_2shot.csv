@@ -1,0 +1,2 @@
+,name,psnr,psnr_variance,ssim,ssim_variance,ssim_256,ssim_256_variance,mae,mae_variance,l1,l1_variance,fid,lpips
+0,v3_highres_align_input_res_flow_single_corr_with_fuse_loss_ep17_2shot,19.845261,7.308283,0.792209,0.008587,0.807075,0.004777,0.025348000228405,0.00017600000137463212,0.04164599999785423,0.0003440000000409782,11.373985359093155,0.17999553680419922

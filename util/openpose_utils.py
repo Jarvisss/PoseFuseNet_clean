@@ -47,6 +47,8 @@ COCO_17 =  { "Nose":0, "LEye":1, "REye":2, "LEar":3, "REar":4, "LShoulder":5,
              "RShoulder":6, "LElbow":7, "RElbow":8, "LWrist":9, "RWrist":10, "LHip":11, 
              "RHip":12, "LKnee":13, "RKnee":14, "LAnkle":15, "RAnkle":16} 
 
+
+
 Human36m_17 = {'Hip':0, 'RHip':1, 'RKnee':2, 'RFoot':3, 'LHip':4, 'LKnee':5, 'LFoot':6,
                 'Spine':7, 'Thorax':8, 'Neck/Nose':9, 'Head':10, 'LShoulder':11,
                 'LElbow':12, 'LWrist':13, 'RShoulder':14, 'RElbow':15, 'RWrist':16}                         
@@ -341,6 +343,14 @@ def openpose25_to_coco17(pose_joints_25):
         pose_joints_17[:, i] = pose_joints_25[:, OPENPOSE_25[key]]
         i = i+1
     return pose_joints_17  
+
+def openpose17_to_coco18(pose_joints_17):
+    pose_joints_18 = np.zeros((2,18)).astype(pose_joints_17.dtype)
+    i = 0
+    for key in COCO_17:
+        pose_joints_17[:, i] = pose_joints_25[:, OPENPOSE_25[key]]
+        i = i+1
+
 
 def openpose18_to_coco17(pose_joints_18):
     pose_joints_17 = np.zeros((2,17)).astype(pose_joints_18.dtype)

@@ -193,7 +193,7 @@ def draw_legend():
     handles = [mpatches.Patch(color=np.array(color) / 255.0, label=name) for color, name in zip(COLORS, LABELS)]
     plt.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
 
-def get_scale_trans(source_kp:np.ndarray, target_kp:np.ndarray):
+def get_scale_trans(source_kp:np.ndarray, target_kp:np.ndarray, width, height):
 
     '''
     @source_kp [2,18] in x,y order
@@ -214,7 +214,7 @@ def get_scale_trans(source_kp:np.ndarray, target_kp:np.ndarray):
 
     # print('scale: ',scale)
 
-    center = np.array([(175+0)/2, (255+0)/2]) # the center of image
+    center = np.array([(width-1)/2, (height-1)/2]) # the center of image
     # trans = (target_kp[:,1] - center)/scale + center - source_kp[:,1]
     trans = target_kp[:,1] - (source_kp[:,1] - center)*scale - center
     # print('trans: ',trans)

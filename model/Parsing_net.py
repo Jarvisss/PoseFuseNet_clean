@@ -119,11 +119,15 @@ class MaskGenerator(nn.Module):
         
         mult_prev = mult * 2
         self.decoder_out = ResBlockUpNorm(ngf*mult_prev, onc, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+        self.attn_out = ResBlockUpNorm(ngf*mult_prev, onc, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
         
 
-    def forward(self, image1, mask1, pose2):
+    def forward(self, image1, mask1, pose2, pose_1=None):
         _,_,H,W = image1.shape
-        x_in = torch.cat((image1, mask1, pose2), dim=1) # (43, 256, 256)
+        if pose_1 is None:
+            x_in = torch.cat((image1, mask1, pose2), dim=1) # (43, 256, 256)
+        else:
+            x_in = torch.cat((image1, mask1,pose_1, pose2), dim=1) # (43, 256, 256)
         out = self.encoder_block0(x_in)
         result = [out]
         for i in range(1, self.encoder_layers):
@@ -139,7 +143,78 @@ class MaskGenerator(nn.Module):
         
         skip = result[0]
         output_logits = self.decoder_out(torch.cat((out,skip),dim=1))
-        return output_logits
+        output_attn = self.attn_out(torch.cat((out,skip),dim=1))
+        return output_logits, output_attn
+
+class MaskGenerator(nn.Module):
+    '''doc
+    '''
+    def __init__(self, inc=3+1+21,onc=1, ngf=64, n_layers=6,max_nc=512, norm_type='bn', activation='LeakyReLU', use_spectral_norm=False):
+        super(MaskGenerator, self).__init__()
+
+        norm_layer = get_norm_layer(norm_type=norm_type)
+        nonlinearity = get_nonlinearity_layer(activation_type=activation)
+        self.inc = inc
+        self.onc = onc
+        self.ngf = ngf
+        self.norm_type = norm_type
+
+        self.max_nc = max_nc
+        self.encoder_layers = n_layers
+        self.decoder_layers = n_layers
+
+        self._make_layers(self.ngf, self.max_nc, norm_layer, nonlinearity, use_spectral_norm)
+
+    def _make_layers(self, ngf, max_nc, norm_layer, nonlinearity, use_spectral_norm):
+        inc = self.inc
+        onc = self.onc
+        self.encoder_block0 = ResBlockEncoder(inc, ngf, ngf, norm_layer, nonlinearity, use_spectral_norm)
+        mult = 1
+        for i in range(1, self.encoder_layers):
+            mult_prev = mult
+            mult = min(2 ** i, max_nc//ngf)
+            block = ResBlockEncoder(ngf*mult_prev, ngf*mult, ngf*mult, norm_layer, nonlinearity, use_spectral_norm)    
+            setattr(self, 'encoder' + str(i), block)
+        
+        mult_prev = mult
+        mult = min(2 ** (self.decoder_layers-2), max_nc//ngf)
+        self.decoder_block0 = ResBlockUpNorm(ngf*mult_prev, ngf*mult,norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+
+        for i in range(1, self.decoder_layers-1):
+            mult_prev = mult * 2
+            mult = min(2 ** (self.decoder_layers-i-2), max_nc//ngf)
+            block = ResBlockUpNorm(ngf*mult_prev, ngf*mult, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+            setattr(self, 'decoder' + str(i), block)
+        
+        mult_prev = mult * 2
+        self.decoder_out = ResBlockUpNorm(ngf*mult_prev, onc, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+        self.attn_out = ResBlockUpNorm(ngf*mult_prev, onc, norm_type=self.norm_type, use_spectral_norm=use_spectral_norm)
+        
+
+    def forward(self, image1, mask1, pose2, pose_1=None):
+        _,_,H,W = image1.shape
+        if pose_1 is None:
+            x_in = torch.cat((image1, mask1, pose2), dim=1) # (43, 256, 256)
+        else:
+            x_in = torch.cat((image1, mask1,pose_1, pose2), dim=1) # (43, 256, 256)
+        out = self.encoder_block0(x_in)
+        result = [out]
+        for i in range(1, self.encoder_layers):
+            model = getattr(self, 'encoder' + str(i))
+            out = model(out)
+            result.append(out) 
+        
+        out = self.decoder_block0(out)
+        for i in range(1, self.decoder_layers-1):
+            skip = result[self.encoder_layers-i-1]
+            model = getattr(self, 'decoder'+str(i))
+            out = model(torch.cat((out,skip),dim=1))
+        
+        skip = result[0]
+        output_logits = self.decoder_out(torch.cat((out,skip),dim=1))
+        output_attn = self.attn_out(torch.cat((out,skip),dim=1))
+        return output_logits, output_attn
+
 
 
 

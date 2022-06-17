@@ -7,11 +7,11 @@ from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
 from skimage.measure import compare_ssim
 from skimage.measure import compare_psnr
-from skimage import transform
+# from skimage import transform
+from PIL import Image
 import glob
 import argparse
 import matplotlib.pyplot as plt
-from script.inception import InceptionV3
 from script.PerceptualSimilarity.models.dist_model import DistModel
 # import script.PerceptualSimilarity.lpips as lpips
 import pandas as pd
@@ -19,10 +19,14 @@ import json
 import imageio
 from skimage.draw import circle, line_aa, polygon
 from tqdm import tqdm
+# import  script.inception as inception
+from script.inception import InceptionV3
 
-
-resize_and_padding = True # 我们只对ssim等metrics做padding，为了公平对比
-ori_shape = [256,176]
+# 我们只对ssim等metrics做padding，
+# 为了公平对比, LPIPS和FID都是在 --[256,256]-- 下比，SSIM是先resize到--[176,256]--再padding到--[256,256]--下比
+resize_and_padding = True 
+# ori_shape = [256,176]
+ori_shape = [176,256]
 if resize_and_padding:
     metrics_save_name = 'metrics_pad.npz'
     stats_save_name = 'statistics_pad.npz'
@@ -36,9 +40,8 @@ def addBounding(image, bound=40):
     assert(w==176)
     assert(c==3)
     image_bound = np.ones((h, w+bound*2, c))*255
-    # image_bound = image_bound.astype(np.uint8)
+    image_bound = image_bound.astype(np.uint8)
     image_bound[:, bound:bound+w] = image
-
     return image_bound
 
 
@@ -358,15 +361,15 @@ class Reconstruction_Metrics():
 
                 # print(gt_image_list[index])
                 # print(input_image_list[index])
-                # if resize_and_padding:
-                #     img_gt   = addBounding( transform.resize((imread(str(gt_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
-                #     img_pred = addBounding( transform.resize((imread(str(input_image_list[index]))).astype(np.float32), output_shape=ori_shape)) / 255.0
-                # else:
-                #     img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
-                #     img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
+                if resize_and_padding:
+                    img_gt   = addBounding( np.array(Image.fromarray(imread(str(gt_image_list[index]))).resize(ori_shape)) ) / 255.0
+                    img_pred = addBounding( np.array(Image.fromarray(imread(str(input_image_list[index]))).resize(ori_shape)) ) / 255.0
+                else:
+                    img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
+                    img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
                 
-                img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
-                img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
+                # img_gt   = (imread(str(gt_image_list[index]))).astype(np.float32) / 255.0
+                # img_pred = (imread(str(input_image_list[index]))).astype(np.float32) / 255.0
 
                 if debug != 0:
                     plt.subplot('121')
@@ -465,9 +468,9 @@ def preprocess_path_for_deform_task(gt_path, distorted_path):
 
     for distorted_image in distorted_image_list:
         image = os.path.basename(distorted_image)
-        # image = image.split('+')[-1]
-        image = image.split('_2_')[-1]
-        image = image.split('_vis')[0] +'.jpg'
+        image = image.split('+')[-1]
+        # image = image.split('_2_')[-1]
+        image = image.split('_vis')[0] + '.jpg'
         gt_image = os.path.join(gt_path, image)
         if not os.path.isfile(gt_image):
             print(gt_image)
@@ -551,7 +554,7 @@ class LPIPS():
 
 
         distance = np.average(result)
-        print('lpips: %.3f'%distance)
+        print('lpips: %.6f'%distance)
         return distance
 
     def calculate_mask_lpips(self, path_1, path_2, batch_size=64, verbose=False, sort=True):
@@ -571,7 +574,6 @@ class LPIPS():
         for i in range(len(files_1)):
             string = annotation_file.loc[os.path.basename(files_2[i])]
             mask = np.tile(np.expand_dims(create_masked_image(string).astype(np.float32), -1), (1,1,3))#.repeat(1,1,3)
-            addBounding(transform.resize(imread(str(fn)).astype(np.float32), output_shape=ori_shape))
             # if resize_and_padding:
             #     imgs_1.append( ( addBounding( transform.resize( imread(str(files_1[i])).astype(np.float32), output_shape=ori_shape ) ) /127.5-1) *mask)
             #     imgs_2.append( ( addBounding( transform.resize( imread(str(files_2[i])).astype(np.float32), output_shape=ori_shape ) ) /127.5-1) *mask)
@@ -672,6 +674,63 @@ def create_masked_image(ano_to):
     mask = produce_ma_mask(kp_to)
     return mask
 
+def inception_score(imgs, cuda=True, batch_size=32, resize=False, splits=1):
+    """Computes the inception score of the generated images imgs
+    imgs -- Torch dataset of (3xHxW) numpy images normalized in the range [-1, 1]
+    cuda -- whether or not to run on GPU
+    batch_size -- batch size for feeding into Inception v3
+    splits -- number of splits
+    """
+    N = len(imgs)
+
+    assert batch_size > 0
+    assert N > batch_size
+
+    # Set up dtype
+    if cuda:
+        dtype = torch.cuda.FloatTensor
+    else:
+        if torch.cuda.is_available():
+            print("WARNING: You have a CUDA device, so you should probably set cuda=True")
+        dtype = torch.FloatTensor
+
+    # Set up dataloader
+    dataloader = torch.utils.data.DataLoader(imgs, batch_size=batch_size)
+
+    # Load inception model
+    inception_model = inception_v3(pretrained=True, transform_input=False).type(dtype)
+    inception_model.eval();
+    up = nn.Upsample(size=(299, 299), mode='bilinear').type(dtype)
+    def get_pred(x):
+        if resize:
+            x = up(x)
+        x = inception_model(x)
+        return F.softmax(x).data.cpu().numpy()
+
+    # Get predictions
+    preds = np.zeros((N, 1000))
+
+    for i, batch in enumerate(dataloader, 0):
+        batch = batch.type(dtype)
+        batchv = Variable(batch)
+        batch_size_i = batch.size()[0]
+
+        preds[i*batch_size:i*batch_size + batch_size_i] = get_pred(batchv)
+
+    # Now compute the mean kl-div
+    split_scores = []
+
+    for k in range(splits):
+        part = preds[k * (N // splits): (k+1) * (N // splits), :]
+        py = np.mean(part, axis=0)
+        scores = []
+        for i in range(part.shape[0]):
+            pyx = part[i, :]
+            scores.append(entropy(pyx, py))
+        split_scores.append(np.exp(np.mean(scores)))
+
+    return np.mean(split_scores), np.std(split_scores)
+
 if __name__ == "__main__":
     print('load start')
 
@@ -695,16 +754,31 @@ if __name__ == "__main__":
 
     for arg in vars(args):
         print('[%s] =' % arg, getattr(args, arg))
+    gt_list, distorated_list = preprocess_path_for_deform_task(args.gt_path, args.distorated_path) # 让两个list一致
+
+    print('calculate inception score')
+    # files = get_image_list(distorated_list)
+    # imgs = np.array([imread(str(fn)).astype(np.uint8) for fn in files])
+    # imgs = np.array([addBounding( transform.resize(imread(str(fn)), output_shape=ori_shape)).astype(np.uint8) for fn in files])
+    # imgs = [addBounding(np.array(Image.fromarray(imread(str(fn))).resize(ori_shape)) ) for fn in files]
+    # imgs = [np.array(Image.fromarray(imread(str(fn))).resize(ori_shape)) for fn in files]
+
+    # inception_score, inception_variance = inception.get_inception_score(imgs, batch_size=10)
+    # print('inception score, variance:', inception_score, inception_variance)
 
     print('calculate fid metric...')
     fid_score = fid.calculate_from_disk(args.distorated_path, args.fid_real_path)
-    gt_list, distorated_list = preprocess_path_for_deform_task(args.gt_path, args.distorated_path) # 让两个list一致
-    print('calculate reconstruction metric...')
-    rec_dic = rec.calculate_from_disk(distorated_list, gt_list, save_path=args.distorated_path, sort=False, debug=False)
+    # print(distorated_list)
+    # print(gt_list)
     print('calculate LPIPS...')
     lpips_score = lpips.calculate_from_disk(distorated_list, gt_list, sort=False, verbose=True, batch_size=64)
     if args.calculate_mask:
         mask_lpips_score = lpips.calculate_mask_lpips(distorated_list, gt_list, sort=False)
+
+    print('calculate reconstruction metric...')
+    rec_dic = rec.calculate_from_disk(distorated_list, gt_list, save_path=args.distorated_path, sort=False, debug=False)
+    
+
 
     dic = {}
     dic['name'] = [args.name]

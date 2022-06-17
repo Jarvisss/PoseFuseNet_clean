@@ -84,7 +84,7 @@ def getAffineParam(angle, scale, shift):
 
         return affine_param
 
-def load_skeleton(B_path, load_size=(256,256), is_clean_pose=False, no_bone_RGB=False, pose_scale=255, affine=None):
+def load_skeleton(B_path, load_size=(256,256), is_clean_pose=False, no_bone_RGB=True, pose_scale=255, affine=None):
     
     from util import openpose_utils
     
@@ -93,8 +93,9 @@ def load_skeleton(B_path, load_size=(256,256), is_clean_pose=False, no_bone_RGB=
     pose_dict = openpose_utils.obtain_2d_cords(B_coor, resize_param=load_size, org_size=load_size, affine=affine)
     alpha_pose_body = pose_dict['body']
     if not is_clean_pose:
-        pose_body = openpose_utils.openpose18_to_coco17(alpha_pose_body)
-
+        pose_body = alpha_pose_body
+        # pose_body = openpose_utils.openpose18_to_coco17(alpha_pose_body)
+        pass
     pose_numpy = openpose_utils.obtain_map(pose_body, load_size) 
     pose = np.transpose(pose_numpy,(2, 0, 1))
     pose = torch.Tensor(pose)

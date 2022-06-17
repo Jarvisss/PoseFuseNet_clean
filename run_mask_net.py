@@ -83,6 +83,7 @@ def get_parser():
     parser.add_argument('--categories', type=int, default=9)
     parser.add_argument('--use_parsing', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--use_input_mask', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
+    parser.add_argument('--use_input_y', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--align_input', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
     parser.add_argument('--use_simmap', action='store_true', help='use clean pose, only for fashionVideo and iPER dataset')
 
@@ -242,7 +243,10 @@ def init_generator(opt, path_to_chkpt):
     mask_nc = 1
     n_layers = 5
 
-    GP = MaskGenerator(inc=image_nc+structure_nc+mask_nc,onc=mask_nc, n_layers=n_layers,ngf=64, max_nc=512, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    if opt.use_input_y:
+        GP = MaskGenerator(inc=image_nc+structure_nc*2+mask_nc,onc=mask_nc, n_layers=n_layers,ngf=64, max_nc=512, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    else:
+        GP = MaskGenerator(inc=image_nc+structure_nc+mask_nc,onc=mask_nc, n_layers=n_layers,ngf=64, max_nc=512, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     
     
     if opt.parallel:
@@ -281,7 +285,7 @@ def train(opt, exp_name):
     dataset = make_dataset(opt)
     dataloader = make_dataloader(opt, dataset)
     
-    opt.phase='eval'
+    opt.phase='test'
     # test_dataset = make_dataset(opt)
     eval_dataset = make_dataset(opt)
     # test_dataloader = make_dataloader(opt, dataset)
@@ -349,11 +353,25 @@ def train(opt, exp_name):
 
             '''Get pixel wise logits'''
             logits = []
+            attns = []
             for k in range(0, opt.K):
-                logit_k = GP(ref_xs[k], ref_ms[k], g_y) # [B, 1, H, W], [B, 1, H, W]
+                if opt.use_input_y:
+                    logit_k, attn_k = GP(ref_xs[k], ref_ms[k], g_y, pose_1=ref_ys[k]) # [B, 1, H, W], [B, 1, H, W]
+                else:
+                    logit_k, attn_k = GP(ref_xs[k], ref_ms[k], g_y) # [B, 1, H, W], [B, 1, H, W]
+
                 logits += [logit_k]
+                attns += [attn_k]
             
-            logit_avg = sum(logits) / opt.K #  [B, 1, H, W]
+            attn_norm = torch.cat(attns, dim=1)
+            attn_norm = nn.Softmax(dim=1)(attn_norm)
+
+            logit_weighted = []
+            for k in range(0, opt.K):
+                logit_weighted += [logits[k] * attn_norm[:,k:k+1,...]]
+
+            # logit_avg = sum(logits) / opt.K #  [B, 1, H, W]
+            logit_avg = sum(logit_weighted) #  [B, 1, H, W]
             m_hat = nn.Sigmoid()(logit_avg)
             m_hat[m_hat>0.5]=1
             m_hat[m_hat<=0.5]=0
@@ -391,7 +409,7 @@ def train(opt, exp_name):
         save_generator(opt.parallel, epoch+1, lossesG, GP, i_batch, optimizerG, path_to_chkpt)
     writer.close()
 
-def evaluate(opt,dataset,path_to_chkpt):
+def evaluate(opt,dataset,path_to_chkpt, save_img=False, save_dir=None):
     criterion = nn.BCEWithLogitsLoss().to(device)
     GP, optimizerG = init_generator(opt, path_to_chkpt)
     dataloader = DataLoader(dataset, 1, False, num_workers=8, drop_last=False)
@@ -406,7 +424,8 @@ def evaluate(opt,dataset,path_to_chkpt):
     epoch_loss_G = 0
     pbar = tqdm(dataloader, leave=True, initial=0)
     for i_batch, batch_data in enumerate(pbar, start=0):
-        
+        froms = batch_data['froms']
+        to = batch_data['to']
         ref_xs = batch_data['ref_xs']
         ref_ys = batch_data['ref_ys']
         g_x = batch_data['g_x']
@@ -425,14 +444,46 @@ def evaluate(opt,dataset,path_to_chkpt):
 
         g_x = g_x.to(device) # [B, 3, 256, 256]
         g_y = g_y.to(device) # [B, 20, 256, 256]
-        logits = []
-        for k in range(0, opt.K):
-            logit_k = GP(ref_xs[k], ref_ms[k], g_y) # [B, 1, H, W], [B, 1, H, W]
-            logits += [logit_k]
+        # logits = []
+        # for k in range(0, opt.K):
+        #     logit_k = GP(ref_xs[k], ref_ms[k], g_y) # [B, 1, H, W], [B, 1, H, W]
+        #     logits += [logit_k]
         
-        logit_avg = sum(logits) / opt.K #  [B, 1, H, W]
+        # logit_avg = sum(logits) / opt.K #  [B, 1, H, W]
+        logits = []
+        attns = []
+        for k in range(0, opt.K):
+            if opt.use_input_y:
+                logit_k, attn_k = GP(ref_xs[k], ref_ms[k], g_y, pose_1=ref_ys[k]) # [B, 1, H, W], [B, 1, H, W]
+            else:
+                logit_k, attn_k = GP(ref_xs[k], ref_ms[k], g_y) # [B, 1, H, W], [B, 1, H, W]
+            logits += [logit_k]
+            attns += [attn_k]
+        
+        attn_norm = torch.cat(attns, dim=1)
+        attn_norm = nn.Softmax(dim=1)(attn_norm)
+
+        logit_weighted = []
+        for k in range(0, opt.K):
+            logit_weighted += [logits[k] * attn_norm[:,k:k+1,...]]
+
+        # logit_avg = sum(logits) / opt.K #  [B, 1, H, W]
+        logit_avg = sum(logit_weighted) #  [B, 1, H, W]
+        m_hat = nn.Sigmoid()(logit_avg)
+        m_hat[m_hat>0.5]=1
+        m_hat[m_hat<=0.5]=0
         loss = criterion(logit_avg, g_m)
         epoch_loss_G += loss.item()
+        if save_img and not save_dir==None:
+            test_name = ''
+            # print(froms)
+            for k in range(opt.K):
+                test_name += str(froms[k][0])+'+'
+            test_name += str(to[0])
+            final_img = get_mask_visual_result(opt, ref_xs, ref_ys,ref_ms, g_x, g_y, g_m, m_hat)
+            from PIL import Image
+            Image.fromarray(final_img).save(os.path.join(save_dir,"{}_all.png".format(test_name)))
+
     epoch_loss_G = epoch_loss_G / len(dataloader)
     print('eval loss: %.3f'%(epoch_loss_G))
     return epoch_loss_G
@@ -588,7 +639,21 @@ if __name__ == "__main__":
         print(experiment_name)
         train(opt, experiment_name)
     else:
-        test(opt)
+        with torch.no_grad():
+            experiment_name = opt.test_id
+            test_result_dir = './test_result/{0}/{1}/{2}_shot/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+            test_result_eval_dir = './test_result/{0}/{1}/{2}_shot_eval/'.format(experiment_name, opt.test_ckpt_name, opt.K)
+            
+            path_to_ckpt_dir = opt.root_dir+ 'checkpoints/{0}/'.format(experiment_name)
+        
+            path_to_chkpt_G = path_to_ckpt_dir + '{0}.tar'.format(opt.test_ckpt_name) 
+            if not os.path.isdir(test_result_dir):
+                os.makedirs(test_result_dir)
+            if not os.path.isdir(test_result_eval_dir):
+                os.makedirs(test_result_eval_dir)
+            dataset = make_dataset(opt)
+            evaluate(opt,dataset, path_to_chkpt_G,save_img=True, save_dir=test_result_dir)
+            # test(opt)
 
 
 

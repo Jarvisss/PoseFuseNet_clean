@@ -209,18 +209,26 @@ class ResBlock2d(nn.Module):
     Res block, preserve spatial resolution.
     """
 
-    def __init__(self, in_features, kernel_size=3, padding=1, norm_type='bn', use_spectral_norm=False):
+    def __init__(self, in_features, output_nc=None, hidden_nc=None, kernel_size=3, padding=1, norm_type='bn', use_spectral_norm=False, learnable_shortcut=False):
         super(ResBlock2d, self).__init__()
+        hidden_nc = in_features if hidden_nc is None else hidden_nc
+        output_nc = in_features if output_nc is None else output_nc
+
+        self.learnable_shortcut = True if in_features != output_nc else learnable_shortcut
 
         if use_spectral_norm:
-            self.conv1 = nn.utils.spectral_norm(nn.Conv2d(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size,
+            self.conv1 = nn.utils.spectral_norm(nn.Conv2d(in_channels=in_features, out_channels=hidden_nc, kernel_size=kernel_size,
                                 padding=padding))
-            self.conv2 = nn.utils.spectral_norm(nn.Conv2d(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size,
+            self.conv2 = nn.utils.spectral_norm(nn.Conv2d(in_channels=hidden_nc, out_channels=output_nc, kernel_size=kernel_size,
                                 padding=padding))
         else:
-            self.conv1 = nn.Conv2d(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size, padding=padding)
-            self.conv2 = nn.Conv2d(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size, padding=padding)
+            self.conv1 = nn.Conv2d(in_channels=in_features, out_channels=hidden_nc, kernel_size=kernel_size, padding=padding)
+            self.conv2 = nn.Conv2d(in_channels=hidden_nc, out_channels=output_nc, kernel_size=kernel_size, padding=padding)
 
+        if self.learnable_shortcut:
+            bypass = nn.utils.spectral_norm(nn.Conv2d(in_channels=in_features, out_channels=output_nc, kernel_size=kernel_size,
+                                padding=padding))
+            self.shortcut = nn.Sequential(bypass,)
         self.norm1 = make_norm_layer(norm_type, in_features)
         self.norm2 = make_norm_layer(norm_type, in_features)
         self.relu = nn.LeakyReLU()
@@ -232,7 +240,11 @@ class ResBlock2d(nn.Module):
         out = self.norm2(out)
         out = self.relu(out)
         out = self.conv2(out)
-        out += x
+
+        if self.learnable_shortcut:
+            out += self.shortcut(x)
+        else:
+            out += x
         return out
 
 
@@ -628,13 +640,11 @@ class ResBlock(nn.Module):
         C = psi_slice.shape[1]
         
         res = x
-        
-        out = adaIN(x, psi_slice[:, 0:C//4, :], psi_slice[:, C//4:C//2, :])
-        out = self.relu(out)
-        out = self.conv1(out)
-        out = adaIN(out, psi_slice[:, C//2:3*C//4, :], psi_slice[:, 3*C//4:C, :])
+        out = self.conv1(x)
+        out = adaIN(out, psi_slice[:, 0:C//4, :], psi_slice[:, C//4:C//2, :])
         out = self.relu(out)
         out = self.conv2(out)
+        out = adaIN(out, psi_slice[:, C//2:3*C//4, :], psi_slice[:, 3*C//4:C, :])
         
         out = out + res
         

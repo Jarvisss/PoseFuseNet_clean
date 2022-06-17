@@ -16,6 +16,51 @@ import sys
 import math
 import numbers
 
+
+def make_dataset(opt):
+    """Create dataset"""
+    path_to_dataset = opt.path_to_dataset
+    train_tuples_name = 'fasion-pairs-train.csv' if opt.K==1 else 'fasion-%d_tuples-train.csv'%(opt.K+1)
+    test_tuples_name = 'fasion-pairs-test.csv' if opt.K==1 else 'fasion-%d_tuples-test.csv'%(opt.K+1)
+    path_to_train_label = os.path.join(path_to_dataset,'train_tps_field')
+    path_to_test_label = os.path.join(path_to_dataset,'test_tps_field')
+    path_to_train_sim = os.path.join(path_to_dataset,'train_sim')
+    path_to_test_sim = os.path.join(path_to_dataset,'test_sim')
+    path_to_train_parsing = os.path.join(path_to_dataset, 'train_parsing_merge/')
+    path_to_test_parsing = os.path.join(path_to_dataset, 'test_parsing_merge/')
+
+    if path_to_dataset == '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion':
+        dataset = FashionDataset(
+            phase = opt.phase,
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
+            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train_256/'), 
+            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
+            path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
+            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
+            path_to_train_sim_dir=path_to_train_sim,
+            path_to_test_sim_dir=path_to_test_sim,
+            path_to_train_parsings_dir=path_to_train_parsing, 
+            path_to_test_parsings_dir=path_to_test_parsing, opt=opt)
+    else: # '/dataset/ljw/deepfashion/GLFA_split/fashion'
+        dataset = FashionDataset(
+            phase = opt.phase,
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
+            path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
+            path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
+            path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
+            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
+            path_to_train_sim_dir=path_to_train_sim,
+            path_to_test_sim_dir=path_to_test_sim,
+            path_to_train_parsings_dir=path_to_train_parsing, 
+            path_to_test_parsings_dir=path_to_test_parsing, opt=opt)
+    return dataset
+
 class FashionDataset(data.Dataset):
     """
     @ phase
@@ -86,7 +131,7 @@ class FashionDataset(data.Dataset):
         self.name = 'fashion'
         self.load_size = (load_size, load_size)
         self.anno_size = tuple(opt.anno_size) if opt.anno_size else (load_size,load_size)
-        self.no_bone_RGB = False
+        self.no_bone_RGB = not opt.use_bone_RGB if hasattr(opt, 'use_bone_RGB') else False
         # self.angle = (-10, 10)
         # self.shift = (30, 3)
         # self.scale = (0.8, 1.2)        
@@ -97,7 +142,8 @@ class FashionDataset(data.Dataset):
         self.pose_scale = pose_scale
         self.align_corner = opt.align_corner
         self.use_parsing = opt.use_parsing if hasattr(opt, 'use_parsing') else False
-        self.use_mask = opt.use_input_mask if hasattr(opt, 'use_input_mask') else False
+        self.use_mask = opt.use_input_mask or opt.use_attn_reg if hasattr(opt, 'use_input_mask') else False
+        # self.use_mask = True
         self.align_input = opt.align_input if hasattr(opt, 'align_input') else False
         self.use_tps_sim = opt.use_tps_sim if hasattr(opt, 'use_tps_sim') else False
         self.use_label_field_tps = opt.use_label_field_tps if hasattr(opt, 'use_label_field_tps') else False
@@ -362,7 +408,7 @@ class FashionDataset(data.Dataset):
         sims = []
         
         for i in range(len(ref_ys)):
-            scale, trans = pose_utils.get_scale_trans(ref_ys[i][::-1,:],gt_y[::-1,:]) # y,x to x,y
+            scale, trans = pose_utils.get_scale_trans(ref_ys[i][::-1,:],gt_y[::-1,:], self.anno_size[1], self.anno_size[0]) # y,x to x,y
             grid = self.get_warp_grid(scale, trans, self.anno_size)
             ref_direction = pose_utils.getDirection(ref_ys[i])
             g_direction = pose_utils.getDirection(gt_y)
@@ -529,17 +575,13 @@ class FashionDataset(data.Dataset):
 
         g_j = self.load_keypoints(tuple_df, 'to')
         ref_js = []
-        ref_scale = []
-        ref_trans = []
+        for i, from_idx in enumerate(from_indices):
+            ref_js += [self.load_keypoints(tuple_df, from_idx)]
         ref_affine_params = [None]*self._nb_inputs
         ref_affine_matrixs = [None]*self._nb_inputs
         if self.align_input:
             for i, from_idx in enumerate(from_indices):
-                ref_js += [self.load_keypoints(tuple_df, from_idx)]
-
-                scale, trans = pose_utils.get_scale_trans(ref_js[i][::-1,:], g_j[::-1,:])
-                ref_scale += [scale]
-                ref_trans += [trans]
+                scale, trans = pose_utils.get_scale_trans(ref_js[i][::-1,:], g_j[::-1,:], self.anno_size[1], self.anno_size[0])
                 affine_param = dict()
                 affine_param['angle']=0
                 affine_param['scale']=scale
@@ -555,19 +597,21 @@ class FashionDataset(data.Dataset):
 
         g_skeleton = self.load_skeleton(tuple_df, 'to')
         ref_skeletons = [self.load_skeleton(tuple_df, from_idx, ref_affine_matrixs[i]) for i, from_idx in enumerate(from_indices)]
+        if self.use_parsing:
+            ref_parsings = [self.load_parsing(tuple_df, from_idx, categories=self._parsing_categories, affine=ref_affine_params[i]) for i, from_idx in enumerate(from_indices)] if self.use_parsing else None
+            g_parsing = self.load_parsing(tuple_df, 'to', categories=self._parsing_categories) if self.use_parsing else None
+        if self.use_mask:
+            ref_fg_masks = [self.load_fg_mask(tuple_df, from_idx, affine=ref_affine_params[i]) for i, from_idx in enumerate(from_indices)] if self.use_mask else None
+            g_fg_mask = self.load_fg_mask(tuple_df, 'to') if self.use_mask else None
 
-        ref_parsings = [self.load_parsing(tuple_df, from_idx, categories=self._parsing_categories, affine=ref_affine_params[i]) for i, from_idx in enumerate(from_indices)] if self.use_parsing else None
-        g_parsing = self.load_parsing(tuple_df, 'to', categories=self._parsing_categories) if self.use_parsing else None
-
-        ref_fg_masks = [self.load_fg_mask(tuple_df, from_idx, affine=ref_affine_params[i]) for i, from_idx in enumerate(from_indices)] if self.use_mask else None
-        g_fg_mask = self.load_fg_mask(tuple_df, 'to') if self.use_mask else None
-
+        
         
 
         # print('get image item time:%.3f'%(image_end-start))
         ref_ys = [ref_skeletons[i] for i in range(len(ref_skeletons))]
         
         g_y = g_skeleton
+        
         # print(g_j.data.numpy())
         # print(to_name)
         structure_end = time.time()

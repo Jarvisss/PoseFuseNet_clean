@@ -166,28 +166,47 @@ def init_weights(m, init_type='xavier'):
 def make_dataset(opt):
     """Create dataset"""
     path_to_dataset = opt.path_to_dataset
+    train_tuples_name = 'fasion-pairs-train.csv' if opt.K==1 else 'fasion-%d_tuples-train.csv'%(opt.K+1)
+    test_tuples_name = 'fasion-pairs-test.csv' if opt.K==1 else 'fasion-%d_tuples-test.csv'%(opt.K+1)
+    path_to_train_label = os.path.join(path_to_dataset,'train_tps_field')
+    path_to_test_label = os.path.join(path_to_dataset,'test_tps_field')
+    path_to_train_sim = os.path.join(path_to_dataset,'train_sim')
+    path_to_test_sim = os.path.join(path_to_dataset,'test_sim')
+    path_to_train_parsing = os.path.join(path_to_dataset, 'train_parsing_merge/')
+    path_to_test_parsing = os.path.join(path_to_dataset, 'test_parsing_merge/')
+
     if path_to_dataset == '/home/ljw/playground/Global-Flow-Local-Attention/dataset/fashion':
         dataset = FashionDataset(
             phase = opt.phase,
-            path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-train.csv'), 
-            path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-test.csv'), 
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
             path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train_256/'), 
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test_256/'),
             path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
             path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
-            opt=opt)
-    else: # '/home/ljw/playground/Multi-source-Human-Image-Generation/data/fasion-dataset'
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
+            path_to_train_sim_dir=path_to_train_sim,
+            path_to_test_sim_dir=path_to_test_sim,
+            path_to_train_parsings_dir=path_to_train_parsing, 
+            path_to_test_parsings_dir=path_to_test_parsing, opt=opt)
+    else: # '/dataset/ljw/deepfashion/GLFA_split/fashion'
         dataset = FashionDataset(
             phase = opt.phase,
-            path_to_train_tuples=os.path.join(path_to_dataset, 'fasion-3_tuples-train.csv'), 
-            path_to_test_tuples=os.path.join(path_to_dataset, 'fasion-4_tuples-test.csv'), 
+            path_to_train_tuples=os.path.join(path_to_dataset, train_tuples_name), 
+            path_to_test_tuples=os.path.join(path_to_dataset, test_tuples_name), 
             path_to_train_imgs_dir=os.path.join(path_to_dataset, 'train/'), 
             path_to_test_imgs_dir=os.path.join(path_to_dataset, 'test/'),
-            path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train_new_split.csv'), 
-            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test_new_split.csv'), 
-            opt=opt)
+            path_to_train_anno=os.path.join(path_to_dataset, 'fasion-annotation-train.csv'), 
+            path_to_test_anno=os.path.join(path_to_dataset, 'fasion-annotation-test.csv'), 
+            path_to_train_label_dir=path_to_train_label,
+            path_to_test_label_dir=path_to_test_label,
+            path_to_train_sim_dir=path_to_train_sim,
+            path_to_test_sim_dir=path_to_test_sim,
+            path_to_train_parsings_dir=path_to_train_parsing, 
+            path_to_test_parsings_dir=path_to_test_parsing, opt=opt)
     return dataset
-
+    
 def make_dataloader(opt, dataset):
     is_train = opt.phase == 'train'
     batch_size = 1 if not is_train else opt.batch_size
@@ -230,9 +249,9 @@ def save_generator(parallel, epoch, lossesG, GE, GF, GD, i_batch, optimizerG,pat
     torch.save({
         'epoch': epoch,
         'lossesG': lossesG,
-        'GE_state_dict': GE_state_dict,
+        'GE_state_dict': None,
         'GF_state_dict': GF_state_dict,
-        'GD_state_dict': GD_state_dict,
+        'GD_state_dict': None,
         'i_batch': i_batch,
         'optimizerG': optimizerG.state_dict(),
     }, path_to_chkpt_G)
@@ -290,8 +309,8 @@ def init_generator_with_occ(opt, path_to_chkpt):
         structure_nc += 20
     if opt.use_simmap:
         image_nc += 13
-    from model.pyramid_flow_generator_with_occlu_attn import FlowGenerator
-    GF = FlowGenerator(image_nc=image_nc, structure_nc=structure_nc, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
+    from model.pyramid_flow_generator_with_occlu_attn import FlowGenerator, FlowGenerator2
+    GF = FlowGenerator2(inc=image_nc+structure_nc*2, n_layers=5, flow_layers= flow_layers, ngf=32, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     GE = AppearanceEncoder(n_layers=opt.n_enc, inc=3, use_spectral_norm=opt.use_spectral_G)
     # GE = AppearanceEncoder(n_layers=3, inc=3, ngf=64, max_nc=256, norm_type=opt.norm_type, activation=opt.activation, use_spectral_norm=opt.use_spectral_G)
     
@@ -356,9 +375,10 @@ def train_flow_net(opt, exp_name):
     i_batch_current = checkpoint['i_batch']
     i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
     optimizerG.load_state_dict(checkpoint['optimizerG'])
+    
+    GE = VGG19().to(device)
     _freeze(GE)
     _freeze(GD)
-    GE = VGG19().to(device)
     '''create tensorboard writter'''
     writer = create_writer(path_to_log_dir)
     
@@ -398,15 +418,16 @@ def train_flow_net(opt, exp_name):
             
             flows, flow_ones, masks, xfs = [], [], [], []
             flows_down,masks_down, xfs_warp = [], [], []
-            g_xf = GE(g_x)['relu4_1']
+            with torch.no_grad():
+                g_xf = GE(g_x)['relu4_1']
             for k in range(0, opt.K):
                 flow_ks, mask_ks = GF(ref_xs[k], ref_ys[k], g_y) # 32, 64
                 flow_k = flow_ks[1]
                 # print(flow_k.shape)
                 mask_k = mask_ks[1]
                 # print(mask_k.shape)
-
-                xf_k = GE(ref_xs[k])['relu4_1']
+                with torch.no_grad():
+                    xf_k = GE(ref_xs[k])['relu4_1']
                 # print(xf_k.shape)
                 flow_k_down = F.interpolate(flow_k * xf_k.shape[2] / flow_k.shape[2], size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
 
@@ -770,8 +791,9 @@ def train_flow_net_with_occ(opt, exp_name):
     i_batch_current = checkpoint['i_batch']
     i_batch_total = epochCurrent * dataloader.__len__() // opt.batch_size + i_batch_current
     optimizerG.load_state_dict(checkpoint['optimizerG'])
-    _freeze(GE)
+    
     GE = VGG19().to(device)
+    _freeze(GE)
     '''create tensorboard writter'''
     writer = create_writer(path_to_log_dir)
     
@@ -806,15 +828,17 @@ def train_flow_net_with_occ(opt, exp_name):
             
             flows, flow_ones, masks, xfs = [], [], [], []
             flows_down,masks_down, xfs_warp = [], [], []
-            g_xf = GE(g_x)['relu4_1']
+
+            with torch.no_grad():
+                g_xf = GE(g_x)['relu4_1']
             for k in range(0, opt.K):
                 flow_ks, mask_ks, _ = GF(ref_xs[k], ref_ys[k], g_y) # 32, 64
                 flow_k = flow_ks[1]
                 # print(flow_k.shape)
                 mask_k = mask_ks[1]
                 # print(mask_k.shape)
-
-                xf_k = GE(ref_xs[k])['relu4_1']
+                with torch.no_grad():
+                    xf_k = GE(ref_xs[k])['relu4_1']
                 # print(xf_k.shape)
                 flow_k_down = F.interpolate(flow_k * xf_k.shape[2] / flow_k.shape[2], size=xf_k.shape[2:], mode='bilinear',align_corners=opt.align_corner)
 

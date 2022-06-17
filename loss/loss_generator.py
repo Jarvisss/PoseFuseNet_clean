@@ -112,6 +112,77 @@ class AffineRegularizationLoss(nn.Module):
         grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
         return flow_field+grid
 
+
+
+class FusingCompactnessLoss(nn.Module):
+    r"""
+    """
+
+    def __init__(self, K, layer=['relu1_1','relu2_1','relu3_1','relu4_1']):
+        super(FusingCompactnessLoss, self).__init__()
+        self.add_module('vgg', VGG19())
+        self.layer = layer
+        self.eps = 1e-8
+        self.resample = Resample2d(4,1,sigma=2)
+        self.criterion = torch.nn.L1Loss()
+        self.K = K
+        
+        pass
+
+    def __call__(self, target, source_list, flow_list, attention_list,used_layers):
+        used_layers=sorted(used_layers, reverse=True)
+        assert(len(source_list) == self.K)
+        assert(len(flow_list) == self.K)
+        # assert(len(mask_list) == self.K) # mask wont be useful here
+        assert(len(attention_list) == self.K)
+
+        assert(len(flow_list[0])==len(used_layers))
+        # assert(len(mask_list[0])==len(used_layers))
+        assert(len(attention_list[0])==len(used_layers))
+        loss = 0
+
+        self.target_vgg = self.vgg(target)
+        self.sources_vggs = []
+        for source in source_list:
+            self.sources_vggs.append(self.vgg(source))
+
+
+        for i in range(len(flow_list[0])): # i 表示是第几层网络
+            vgg_layer = self.layer[used_layers[i]]
+            layer_fused_sources_vgg = self.calculate_fused_vgg_at_layer(self.sources_vggs, attention_list, flow_list, i, vgg_layer)
+            loss += self.criterion(layer_fused_sources_vgg, self.target_vgg[vgg_layer])
+
+        return loss
+        pass
+
+    def calculate_fused_vgg_at_layer(self,source_vggs, attentions, flows, layer, vgg_layer):
+        for k in range(len(flows)):
+            source_k_vgg_layer = source_vggs[k][vgg_layer]
+            flow = flows[k][layer]
+            attention = attentions[k][layer]
+            warped_k = self.bilinear_warp(source_k_vgg_layer, flow)
+            if k == 0:
+                fused = warped_k * attention
+            else:
+                fused += warped_k * attention
+        
+        return fused
+                
+
+
+    
+    def bilinear_warp(self, source, flow):
+        [b, c, h, w] = source.shape
+        x = torch.arange(w).view(1, -1).expand(h, -1).type_as(source).float() / (w-1)
+        y = torch.arange(h).view(-1, 1).expand(-1, w).type_as(source).float() / (h-1)
+        grid = torch.stack([x,y], dim=0)
+        grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
+        grid = 2*grid - 1
+        flow = 2*flow/torch.tensor([w, h]).view(1, 2, 1, 1).expand(b, -1, h, w).type_as(flow)
+        grid = (grid+flow).permute(0, 2, 3, 1)
+        input_sample = F.grid_sample(source, grid, align_corners=True)
+        return input_sample
+
 class PerceptualCorrectness(nn.Module):
     r"""
     """
@@ -123,22 +194,27 @@ class PerceptualCorrectness(nn.Module):
         self.eps=1e-8 
         self.resample = Resample2d(4, 1, sigma=2)
 
-    def __call__(self, target, source, flow_list, used_layers, mask=None, use_bilinear_sampling=True):
+    def __call__(self, target, source, flow_list, used_layers, mask=None, use_bilinear_sampling=True, target_flow_list=None):
         used_layers=sorted(used_layers, reverse=True)
         # self.target=target
         # self.source=source
         self.target_vgg, self.source_vgg = self.vgg(target), self.vgg(source)
         loss = 0
-        for i in range(len(flow_list)):
-            loss += self.calculate_loss(flow_list[i], self.layer[used_layers[i]], mask, use_bilinear_sampling)
-
+        if target_flow_list is not None:
+            assert len(target_flow_list)==len(flow_list), 'target flow length not equal to source flow'
+            for i in range(len(flow_list)):
+                loss += self.calculate_loss(flow_list[i], self.layer[used_layers[i]], mask, use_bilinear_sampling, target_flow_list[i])
+        else:
+            for i in range(len(flow_list)):
+                loss += self.calculate_loss(flow_list[i], self.layer[used_layers[i]], mask, use_bilinear_sampling, None)
         return loss
 
-    def calculate_loss(self, flow, layer, mask=None, use_bilinear_sampling=True):
+    def calculate_loss(self, flow , layer, mask=None, use_bilinear_sampling=True, target_flow=None):
         target_vgg = self.target_vgg[layer]
         source_vgg = self.source_vgg[layer]
         [b, c, h, w] = target_vgg.shape
         [bf,cf,hf,wf] = flow.shape
+
         # maps = F.interpolate(maps, [h,w]).view(b,-1)
         flow = F.interpolate(flow, [h,w])
         target_all = target_vgg.view(b, c, -1)                      #[b C N2]
@@ -161,6 +237,13 @@ class PerceptualCorrectness(nn.Module):
         else:
             input_sample = self.resample(source_vgg, flow).view(b, c, -1)
 
+        if target_flow is not None:
+            if use_bilinear_sampling:
+                target_sample = self.bilinear_warp(target_vgg, target_flow).view(b, c, -1)
+            else:
+                target_sample = self.resample(target_vgg, target_flow).view(b, c, -1)
+            target_all = target_sample
+            
         correction_sample = F.cosine_similarity(input_sample, target_all)    #[b 1 N2]
         loss_map = torch.exp(-correction_sample/(correction_max+self.eps))
         if mask is None:
