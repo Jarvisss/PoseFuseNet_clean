@@ -102,6 +102,8 @@ ENV/
 
 # other
 .vscode
+__pycache__/
+models/
 checkpoints/
 logs/
 test_result/
