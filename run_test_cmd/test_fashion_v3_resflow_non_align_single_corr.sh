@@ -7,8 +7,6 @@ python run_fashion_pyramid_decoder_residual_flow.py \
  --gpu=0\
  --phase 'test' \
  --align_corner  \
- --use_tps_sim\
- --use_attn_reg\
  --anno_size 256 176 \
  --path_to_dataset '/dataset/ljw/deepfashion/GLFA_split/fashion'\
  --test_ckpt_name 'epoch_24_batch_10000_G'\
